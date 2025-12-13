@@ -10,6 +10,7 @@ from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from ultralytics import YOLO
+from utils.boto import upload_file
 
 app = FastAPI()
 
@@ -74,6 +75,10 @@ async def predict_media(file: UploadFile = File(...)):
             # Save annotated image
             annotated_frame = result.plot()
             cv2.imwrite(str(output_path), annotated_frame)
+            
+            # Upload to S3
+            s3_url = upload_file(str(output_path), output_filename)
+
             
             # Extract data
             for box in result.boxes:
@@ -148,6 +153,10 @@ async def predict_media(file: UploadFile = File(...)):
             cap.release()
             out.release()
             
+            # Upload to S3
+            s3_url = upload_file(str(output_path), output_filename)
+
+            
         else:
             raise HTTPException(status_code=400, detail="Unsupported file type. Use image (jpg, png) or video (mp4, avi).")
             
@@ -166,6 +175,7 @@ async def predict_media(file: UploadFile = File(...)):
     return {
         "status": "success",
         "file_url": f"/static/{output_filename}",
+        "s3_url": s3_url,
         "filename": output_filename,
         "metadata": video_metadata if video_metadata else {"type": "image"},
         "data_summary": f"Found {len(results_data)} frames/items with detections",
