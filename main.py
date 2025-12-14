@@ -10,9 +10,14 @@ from PIL.Image import Image
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+import torch
 from ultralytics import YOLO
 from utils.boto import upload_file
 from utils.cloudinary_uploader import upload_to_cloudinary
+
+# Set device - use GPU if available
+DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
+print(f"Using device: {DEVICE}")
 
 app = FastAPI()
 
@@ -73,7 +78,7 @@ async def predict_media(file: UploadFile = File(...)):
         if extension in ["jpg", "jpeg", "png", "bmp", "webp"]:
             result_type = "image"
             # Process Image
-            results = model(input_path)
+            results = model(input_path, device=DEVICE)
             result = results[0]
             
             # Save annotated image
@@ -128,7 +133,7 @@ async def predict_media(file: UploadFile = File(...)):
                     break
                     
                 # Run YOLO
-                results = model(frame)
+                results = model(frame, device=DEVICE)
                 result = results[0]
                 
                 # Write frame with annotations
