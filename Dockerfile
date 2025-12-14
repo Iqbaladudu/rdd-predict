@@ -1,6 +1,9 @@
 # Menggunakan NVIDIA CUDA base image dengan Ubuntu
 FROM nvidia/cuda:12.6.0-cudnn-runtime-ubuntu22.04
 
+
+ENV TZ=Asia/Jakarta
+RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
 # Install Python 3.13, git, dan git-lfs
 RUN apt-get update && apt-get install -y \
     software-properties-common \
