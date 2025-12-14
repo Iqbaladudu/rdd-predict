@@ -6,6 +6,7 @@ from typing import List, Union
 
 import cv2
 import numpy as np
+from PIL.Image import Image
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -148,21 +149,32 @@ async def predict_media(file: UploadFile = File(...)):
                     })
                 
                 if frame_detections:
+                    # Save frame as image and upload to Cloudinary
+                    frame_filename = f"{request_id}_frame_{frame_idx}.jpg"
+                    frame_path = Path(f"static/{frame_filename}")
+                    cv2.imwrite(str(frame_path), annotated_frame)
+
+                    # Upload frame to Cloudinary
+                    frame_cloudinary_result = upload_to_cloudinary(str(frame_path))
+
+                    # Clean up the frame file to save space
+                    if os.path.exists(frame_path):
+                        os.remove(frame_path)
+
                     results_data.append({
                         "frame": frame_idx,
                         "timestamp": frame_idx / fps if fps > 0 else 0,
-                        "detections": frame_detections
+                        "detections": frame_detections,
+                        "frame_url": frame_cloudinary_result.get("url"),
+                        "frame_public_id": frame_cloudinary_result.get("public_id")
                     })
                 
                 frame_idx += 1
                 
             cap.release()
             out.release()
-            
-            # Upload to S3
-            s3_url = upload_file(str(output_path), output_filename)
-            
-            # Upload to Cloudinary
+
+            # Upload processed video to Cloudinary
             cloudinary_result = upload_to_cloudinary(str(output_path))
             
         else:
