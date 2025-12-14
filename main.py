@@ -40,7 +40,7 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 # Load model
 # This will download yolov8n.pt if not present on first use
 try:
-    model = YOLO("YOLOv8_Small_RDD.pt") 
+    model = YOLO("https://pub-0ccce103f38e4902912534cdb3973783.r2.dev/YOLOv8_Small_RDD.pt") 
 except Exception as e:
     print(f"Error loading model: {e}")
     # Fallback or re-raise
