@@ -11,6 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from ultralytics import YOLO
 from utils.boto import upload_file
+from utils.cloudinary_uploader import upload_to_cloudinary
 
 app = FastAPI()
 
@@ -78,7 +79,9 @@ async def predict_media(file: UploadFile = File(...)):
             
             # Upload to S3
             s3_url = upload_file(str(output_path), output_filename)
-
+            
+            # Upload to Cloudinary
+            cloudinary_result = upload_to_cloudinary(str(output_path))
             
             # Extract data
             for box in result.boxes:
@@ -155,7 +158,9 @@ async def predict_media(file: UploadFile = File(...)):
             
             # Upload to S3
             s3_url = upload_file(str(output_path), output_filename)
-
+            
+            # Upload to Cloudinary
+            cloudinary_result = upload_to_cloudinary(str(output_path))
             
         else:
             raise HTTPException(status_code=400, detail="Unsupported file type. Use image (jpg, png) or video (mp4, avi).")
@@ -175,7 +180,9 @@ async def predict_media(file: UploadFile = File(...)):
     return {
         "status": "success",
         "file_url": f"/static/{output_filename}",
-        "s3_url": s3_url,
+        # "s3_url": s3_url,
+        "cloudinary_url": cloudinary_result.get("url"),
+        "cloudinary_public_id": cloudinary_result.get("public_id"),
         "filename": output_filename,
         "metadata": video_metadata if video_metadata else {"type": "image"},
         "data_summary": f"Found {len(results_data)} frames/items with detections",
