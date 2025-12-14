@@ -47,6 +47,7 @@ def read_root():
 @app.post("/predict")
 async def predict_media(file: UploadFile = File(...)):
     # Generate unique ID for this request
+    result_type = None
     request_id = str(uuid.uuid4())
     filename = file.filename
     # Handle cases where filename might be empty or missing extension
@@ -69,6 +70,7 @@ async def predict_media(file: UploadFile = File(...)):
     
     try:
         if extension in ["jpg", "jpeg", "png", "bmp", "webp"]:
+            result_type = "image"
             # Process Image
             results = model(input_path)
             result = results[0]
@@ -96,6 +98,7 @@ async def predict_media(file: UploadFile = File(...)):
                 })
                 
         elif extension in ["mp4", "avi", "mov", "mkv", "webm"]:
+            result_type = "video"
             # Process Video
             cap = cv2.VideoCapture(str(input_path))
             if not cap.isOpened():
@@ -180,6 +183,7 @@ async def predict_media(file: UploadFile = File(...)):
     return {
         "status": "success",
         "file_url": f"/static/{output_filename}",
+        result_type: result_type,
         # "s3_url": s3_url,
         "cloudinary_url": cloudinary_result.get("url"),
         "cloudinary_public_id": cloudinary_result.get("public_id"),
