@@ -714,7 +714,8 @@
     <script>
         // Configuration
         const API_BASE = window.location.origin;
-        const WS_BASE = `ws://${window.location.host}`;
+        const WS_PROTOCOL = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        const WS_BASE = `${WS_PROTOCOL}//${window.location.host}`;
 
         // State
         let websocket = null;
@@ -1001,7 +1002,20 @@
                 });
 
                 localVideo.srcObject = mediaStream;
-                await new Promise(r => localVideo.onloadedmetadata = r);
+                
+                // Wait for video metadata to load
+                if (localVideo.readyState >= 1) {
+                    // Metadata already loaded
+                } else {
+                    await new Promise(r => localVideo.onloadedmetadata = r);
+                }
+                
+                // Ensure video plays
+                try {
+                    await localVideo.play();
+                } catch (playErr) {
+                    console.warn('[Video] Autoplay blocked, user interaction may be needed:', playErr);
+                }
 
                 captureCanvas.width = localVideo.videoWidth;
                 captureCanvas.height = localVideo.videoHeight;
