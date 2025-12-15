@@ -1,0 +1,1211 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Road Damage Detection</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        :root {
+            --bg: #fafafa;
+            --surface: #ffffff;
+            --surface-alt: #f4f4f5;
+            --border: #e4e4e7;
+            --text: #18181b;
+            --text-muted: #71717a;
+            --accent: #2563eb;
+            --accent-soft: #dbeafe;
+            --success: #16a34a;
+            --success-soft: #dcfce7;
+            --warning: #ca8a04;
+            --warning-soft: #fef9c3;
+            --danger: #dc2626;
+            --danger-soft: #fee2e2;
+        }
+
+        body {
+            font-family: 'DM Sans', system-ui, -apple-system, sans-serif;
+            background: var(--bg);
+            color: var(--text);
+            line-height: 1.5;
+            min-height: 100vh;
+        }
+
+        /* Top Bar */
+        .topbar {
+            background: var(--surface);
+            border-bottom: 1px solid var(--border);
+            padding: 0 24px;
+            height: 64px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            position: sticky;
+            top: 0;
+            z-index: 50;
+        }
+
+        .brand {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .brand-mark {
+            width: 32px;
+            height: 32px;
+            background: var(--accent);
+            border-radius: 6px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: white;
+            font-weight: 600;
+            font-size: 14px;
+        }
+
+        .brand-name {
+            font-weight: 600;
+            font-size: 15px;
+            color: var(--text);
+        }
+
+        .controls {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+
+        .model-picker {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .model-picker label {
+            font-size: 13px;
+            color: var(--text-muted);
+        }
+
+        select {
+            appearance: none;
+            background: var(--surface-alt) url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%2371717a' stroke-width='2'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E") no-repeat right 10px center;
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            padding: 8px 32px 8px 12px;
+            font-family: inherit;
+            font-size: 13px;
+            color: var(--text);
+            cursor: pointer;
+            min-width: 160px;
+        }
+
+        select:focus {
+            outline: none;
+            border-color: var(--accent);
+        }
+
+        .status-indicator {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            padding: 6px 12px;
+            border-radius: 20px;
+            font-size: 12px;
+            font-weight: 500;
+        }
+
+        .status-indicator[data-status="offline"] {
+            background: var(--surface-alt);
+            color: var(--text-muted);
+        }
+
+        .status-indicator[data-status="connecting"] {
+            background: var(--warning-soft);
+            color: var(--warning);
+        }
+
+        .status-indicator[data-status="online"] {
+            background: var(--success-soft);
+            color: var(--success);
+        }
+
+        .status-dot {
+            width: 6px;
+            height: 6px;
+            border-radius: 50%;
+            background: currentColor;
+        }
+
+        .status-indicator[data-status="online"] .status-dot {
+            animation: blink 1.5s ease-in-out infinite;
+        }
+
+        @keyframes blink {
+            50% { opacity: 0.4; }
+        }
+
+        .btn {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            padding: 8px 16px;
+            border: none;
+            border-radius: 6px;
+            font-family: inherit;
+            font-size: 13px;
+            font-weight: 500;
+            cursor: pointer;
+            transition: all 0.15s ease;
+        }
+
+        .btn-primary {
+            background: var(--accent);
+            color: white;
+        }
+
+        .btn-primary:hover:not(:disabled) {
+            background: #1d4ed8;
+        }
+
+        .btn-ghost {
+            background: transparent;
+            color: var(--text-muted);
+            border: 1px solid var(--border);
+        }
+
+        .btn-ghost:hover {
+            background: var(--surface-alt);
+            color: var(--text);
+        }
+
+        .btn-danger {
+            background: var(--danger);
+            color: white;
+        }
+
+        .btn-danger:hover:not(:disabled) {
+            background: #b91c1c;
+        }
+
+        .btn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+        .btn svg {
+            width: 14px;
+            height: 14px;
+        }
+
+        /* Layout */
+        .layout {
+            display: grid;
+            grid-template-columns: 1fr 340px;
+            gap: 20px;
+            padding: 20px 24px;
+            max-width: 1600px;
+            margin: 0 auto;
+        }
+
+        @media (max-width: 1100px) {
+            .layout {
+                grid-template-columns: 1fr;
+            }
+        }
+
+        /* Cards */
+        .card {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 10px;
+        }
+
+        .card-header {
+            padding: 14px 18px;
+            border-bottom: 1px solid var(--border);
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+
+        .card-title {
+            font-size: 13px;
+            font-weight: 600;
+            color: var(--text);
+        }
+
+        .card-body {
+            padding: 18px;
+        }
+
+        /* Main Content */
+        .main-content {
+            display: flex;
+            flex-direction: column;
+            gap: 20px;
+        }
+
+        /* Metrics */
+        .metrics {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 12px;
+        }
+
+        @media (max-width: 700px) {
+            .metrics {
+                grid-template-columns: repeat(2, 1fr);
+            }
+        }
+
+        .metric {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            padding: 16px;
+        }
+
+        .metric-label {
+            font-size: 12px;
+            color: var(--text-muted);
+            margin-bottom: 4px;
+        }
+
+        .metric-value {
+            font-size: 28px;
+            font-weight: 600;
+            line-height: 1.1;
+        }
+
+        .metric-value small {
+            font-size: 14px;
+            font-weight: 400;
+            color: var(--text-muted);
+        }
+
+        /* Video Grid */
+        .video-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 16px;
+        }
+
+        @media (max-width: 800px) {
+            .video-grid {
+                grid-template-columns: 1fr;
+            }
+        }
+
+        .video-card {
+            background: #000;
+            border-radius: 10px;
+            overflow: hidden;
+            position: relative;
+            aspect-ratio: 16/9;
+        }
+
+        .video-card video,
+        .video-card img {
+            width: 100%;
+            height: 100%;
+            object-fit: contain;
+            display: block;
+        }
+
+        .video-label {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            background: rgba(0,0,0,0.6);
+            color: #fff;
+            padding: 4px 10px;
+            border-radius: 4px;
+            font-size: 11px;
+            font-weight: 500;
+            backdrop-filter: blur(4px);
+        }
+
+        .video-label.live::before {
+            content: '';
+            display: inline-block;
+            width: 6px;
+            height: 6px;
+            background: #ef4444;
+            border-radius: 50%;
+            margin-right: 6px;
+            animation: blink 1s infinite;
+        }
+
+        /* Chart */
+        .chart-wrap {
+            height: 180px;
+        }
+
+        /* Sidebar */
+        .sidebar {
+            display: flex;
+            flex-direction: column;
+            gap: 20px;
+        }
+
+        /* Session */
+        .session-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 10px;
+        }
+
+        .session-item {
+            background: var(--surface-alt);
+            padding: 10px 12px;
+            border-radius: 6px;
+        }
+
+        .session-label {
+            font-size: 10px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            color: var(--text-muted);
+            margin-bottom: 2px;
+        }
+
+        .session-value {
+            font-size: 13px;
+            font-weight: 500;
+        }
+
+        /* Damage Summary */
+        .damage-list {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+        }
+
+        .damage-row {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 10px 12px;
+            background: var(--surface-alt);
+            border-radius: 6px;
+        }
+
+        .damage-badge {
+            width: 34px;
+            height: 28px;
+            border-radius: 4px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 10px;
+            font-weight: 600;
+        }
+
+        .damage-badge.d00 { background: #fee2e2; color: #dc2626; }
+        .damage-badge.d10 { background: #fef3c7; color: #d97706; }
+        .damage-badge.d20 { background: #dbeafe; color: #2563eb; }
+        .damage-badge.d40 { background: #ede9fe; color: #7c3aed; }
+
+        .damage-info {
+            flex: 1;
+        }
+
+        .damage-name {
+            font-size: 13px;
+            font-weight: 500;
+        }
+
+        .damage-desc {
+            font-size: 11px;
+            color: var(--text-muted);
+        }
+
+        .damage-count {
+            font-size: 18px;
+            font-weight: 600;
+            color: var(--accent);
+        }
+
+        /* Detection Log */
+        .log-container {
+            max-height: 320px;
+            overflow-y: auto;
+        }
+
+        .log-empty {
+            text-align: center;
+            padding: 32px 16px;
+            color: var(--text-muted);
+            font-size: 13px;
+        }
+
+        .log-item {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 10px 0;
+            border-bottom: 1px solid var(--border);
+        }
+
+        .log-item:last-child {
+            border-bottom: none;
+        }
+
+        .log-thumb {
+            width: 48px;
+            height: 36px;
+            border-radius: 4px;
+            object-fit: cover;
+            background: #000;
+        }
+
+        .log-content {
+            flex: 1;
+            min-width: 0;
+        }
+
+        .log-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .log-class {
+            font-weight: 600;
+            font-size: 13px;
+            color: var(--accent);
+        }
+
+        .log-time {
+            font-size: 10px;
+            color: var(--text-muted);
+        }
+
+        .log-meta {
+            font-size: 11px;
+            color: var(--text-muted);
+            margin-top: 2px;
+        }
+
+        .log-meta .conf {
+            color: var(--success);
+        }
+
+        /* Export */
+        .export-row {
+            display: flex;
+            gap: 10px;
+        }
+
+        .export-row .btn {
+            flex: 1;
+            justify-content: center;
+        }
+
+        /* Scrollbar */
+        ::-webkit-scrollbar {
+            width: 5px;
+        }
+
+        ::-webkit-scrollbar-track {
+            background: transparent;
+        }
+
+        ::-webkit-scrollbar-thumb {
+            background: var(--border);
+            border-radius: 3px;
+        }
+
+        /* Hidden */
+        #captureCanvas {
+            display: none;
+        }
+    </style>
+</head>
+<body>
+    <header class="topbar">
+        <div class="brand">
+            <div class="brand-mark">RD</div>
+            <span class="brand-name">Road Damage Detection</span>
+        </div>
+
+        <div class="controls">
+            <div class="model-picker">
+                <label for="modelSelect">Model</label>
+                <select id="modelSelect">
+                    <option value="" disabled>Loading...</option>
+                </select>
+            </div>
+
+            <div class="status-indicator" id="statusBadge" data-status="offline">
+                <span class="status-dot"></span>
+                <span id="statusText">Offline</span>
+            </div>
+
+            <button class="btn btn-primary" id="startBtn" onclick="startStreaming()">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+                Start
+            </button>
+            <button class="btn btn-danger" id="stopBtn" onclick="stopStreaming()" disabled>
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="6" y="6" width="12" height="12"/></svg>
+                Stop
+            </button>
+        </div>
+    </header>
+
+    <div class="layout">
+        <div class="main-content">
+            <div class="metrics">
+                <div class="metric">
+                    <div class="metric-label">Frames</div>
+                    <div class="metric-value" id="frameCount">0</div>
+                </div>
+                <div class="metric">
+                    <div class="metric-label">Latency</div>
+                    <div class="metric-value" id="latency">0<small>ms</small></div>
+                </div>
+                <div class="metric">
+                    <div class="metric-label">Detections</div>
+                    <div class="metric-value" id="totalDetections">0</div>
+                </div>
+                <div class="metric">
+                    <div class="metric-label">FPS</div>
+                    <div class="metric-value" id="fps">0<small>fps</small></div>
+                </div>
+            </div>
+
+            <div class="video-grid">
+                <div class="video-card">
+                    <video id="localVideo" autoplay muted playsinline></video>
+                    <span class="video-label live">Camera</span>
+                </div>
+                <div class="video-card">
+                    <img id="resultImage" alt="Detection">
+                    <span class="video-label">Processed</span>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="card-header">
+                    <div>
+                        <span class="card-title">Detection Timeline</span>
+                        <p style="font-size: 11px; color: var(--text-muted); margin-top: 2px;">Jumlah kerusakan terdeteksi per interval waktu</p>
+                    </div>
+                    <button class="btn btn-ghost" onclick="clearChart()">Reset</button>
+                </div>
+                <div class="card-body">
+                    <div class="chart-wrap">
+                        <canvas id="detectionChart"></canvas>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div class="sidebar">
+            <div class="card">
+                <div class="card-header">
+                    <span class="card-title">Session</span>
+                </div>
+                <div class="card-body">
+                    <div class="session-grid">
+                        <div class="session-item">
+                            <div class="session-label">ID</div>
+                            <div class="session-value" id="sessionId">—</div>
+                        </div>
+                        <div class="session-item">
+                            <div class="session-label">Started</div>
+                            <div class="session-value" id="sessionStart">—</div>
+                        </div>
+                        <div class="session-item">
+                            <div class="session-label">Duration</div>
+                            <div class="session-value" id="sessionDuration">00:00:00</div>
+                        </div>
+                        <div class="session-item">
+                            <div class="session-label">Resolution</div>
+                            <div class="session-value" id="resolution">—</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="card-header">
+                    <span class="card-title">Damage Types</span>
+                </div>
+                <div class="card-body">
+                    <div class="damage-list">
+                        <div class="damage-row">
+                            <div class="damage-badge d00">D00</div>
+                            <div class="damage-info">
+                                <div class="damage-name">Longitudinal Crack</div>
+                                <div class="damage-desc">Wheel path crack</div>
+                            </div>
+                            <div class="damage-count" id="countD00">0</div>
+                        </div>
+                        <div class="damage-row">
+                            <div class="damage-badge d10">D10</div>
+                            <div class="damage-info">
+                                <div class="damage-name">Transverse Crack</div>
+                                <div class="damage-desc">Perpendicular crack</div>
+                            </div>
+                            <div class="damage-count" id="countD10">0</div>
+                        </div>
+                        <div class="damage-row">
+                            <div class="damage-badge d20">D20</div>
+                            <div class="damage-info">
+                                <div class="damage-name">Alligator Crack</div>
+                                <div class="damage-desc">Fatigue pattern</div>
+                            </div>
+                            <div class="damage-count" id="countD20">0</div>
+                        </div>
+                        <div class="damage-row">
+                            <div class="damage-badge d40">D40</div>
+                            <div class="damage-info">
+                                <div class="damage-name">Pothole</div>
+                                <div class="damage-desc">Surface hole</div>
+                            </div>
+                            <div class="damage-count" id="countD40">0</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="card" style="flex: 1; min-height: 0;">
+                <div class="card-header">
+                    <span class="card-title">Activity Log</span>
+                    <button class="btn btn-ghost" onclick="clearLog()">Clear</button>
+                </div>
+                <div class="card-body log-container" id="detectionLog">
+                    <div class="log-empty">No detections yet</div>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="card-header">
+                    <span class="card-title">Export</span>
+                </div>
+                <div class="card-body">
+                    <div class="export-row">
+                        <button class="btn btn-ghost" onclick="exportJSON()">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><path d="M14 2v6h6"/></svg>
+                            JSON
+                        </button>
+                        <button class="btn btn-ghost" onclick="exportCSV()">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><path d="M14 2v6h6"/><path d="M8 13h8M8 17h8"/></svg>
+                            CSV
+                        </button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <canvas id="captureCanvas"></canvas>
+
+    <script>
+        // Configuration
+        const API_BASE = window.location.origin;
+        const WS_BASE = `ws://${window.location.host}`;
+
+        // State
+        let websocket = null;
+        let mediaStream = null;
+        let isStreaming = false;
+        let frameCount = 0;
+        let totalDetections = 0;
+        let startTime = null;
+        let captureInterval = null;
+        let durationInterval = null;
+        let sessionId = null;
+        let availableModels = [];
+        let selectedModel = null;
+
+        const classCounts = { D00: 0, D10: 0, D20: 0, D40: 0 };
+        const detectionHistory = [];
+        let chart = null;
+        let chartInterval = null;
+        const chartLabels = [];
+        const chartData = { D00: [], D10: [], D20: [], D40: [] };
+        const pendingCounts = { D00: 0, D10: 0, D20: 0, D40: 0 };
+        
+        // Class name to code mapping
+        const CLASS_TO_CODE = {
+            // Standard codes
+            'D00': 'D00',
+            'D10': 'D10',
+            'D20': 'D20',
+            'D40': 'D40',
+            // Full names (various formats)
+            'LONGITUDINAL CRACK': 'D00',
+            'LONGITUDINAL_CRACK': 'D00',
+            'LONGITUDINALCRACK': 'D00',
+            'TRANSVERSE CRACK': 'D10',
+            'TRANSVERSE_CRACK': 'D10',
+            'TRANSVERSECRACK': 'D10',
+            'ALLIGATOR CRACK': 'D20',
+            'ALLIGATOR_CRACK': 'D20',
+            'ALLIGATORCRACK': 'D20',
+            'POTHOLE': 'D40',
+            'POTHOLES': 'D40',
+        };
+        
+        // Function to map class name to code
+        function getClassCode(className) {
+            if (!className) return null;
+            // Remove any trailing numbers (e.g., "Alligator Crack 2" -> "Alligator Crack")
+            const cleanName = className.replace(/\s*\d+$/, '').trim().toUpperCase();
+            return CLASS_TO_CODE[cleanName] || null;
+        }
+
+        // DOM
+        const localVideo = document.getElementById('localVideo');
+        const resultImage = document.getElementById('resultImage');
+        const captureCanvas = document.getElementById('captureCanvas');
+        const ctx = captureCanvas.getContext('2d');
+        const modelSelect = document.getElementById('modelSelect');
+
+        // Fetch models
+        async function fetchModels() {
+            try {
+                const res = await fetch(`${API_BASE}/models`);
+                if (!res.ok) throw new Error(`HTTP ${res.status}`);
+                const data = await res.json();
+                availableModels = data.loaded_models || [];
+
+                modelSelect.innerHTML = '';
+
+                if (availableModels.length === 0) {
+                    modelSelect.innerHTML = '<option disabled>No models</option>';
+                    return;
+                }
+
+                const defaultOpt = document.createElement('option');
+                defaultOpt.value = '';
+                defaultOpt.textContent = 'Default';
+                modelSelect.appendChild(defaultOpt);
+
+                availableModels.forEach(m => {
+                    const opt = document.createElement('option');
+                    opt.value = m.key;
+                    opt.textContent = m.description;
+                    modelSelect.appendChild(opt);
+                });
+
+                if (data.default_model) {
+                    modelSelect.value = data.default_model;
+                    selectedModel = data.default_model;
+                }
+
+                console.log(`[Models] Loaded ${availableModels.length} models`);
+            } catch (e) {
+                console.error('[Models]', e);
+                modelSelect.innerHTML = '<option disabled>Error loading</option>';
+            }
+        }
+
+        modelSelect.addEventListener('change', e => {
+            selectedModel = e.target.value;
+            console.log('[Model]', selectedModel || 'default');
+        });
+
+        function getWSUrl() {
+            return selectedModel ? `${WS_BASE}/predict/stream/${selectedModel}` : `${WS_BASE}/predict/stream`;
+        }
+
+        // Chart initialization
+        function initChart() {
+            const c = document.getElementById('detectionChart').getContext('2d');
+            chart = new Chart(c, {
+                type: 'line',
+                data: {
+                    labels: chartLabels,
+                    datasets: [
+                        {
+                            label: 'D00 - Longitudinal Crack',
+                            borderColor: '#dc2626',
+                            backgroundColor: 'rgba(220,38,38,0.15)',
+                            fill: true,
+                            tension: 0.3,
+                            pointRadius: 3,
+                            pointBackgroundColor: '#dc2626',
+                            borderWidth: 2,
+                            data: chartData.D00
+                        },
+                        {
+                            label: 'D10 - Transverse Crack',
+                            borderColor: '#d97706',
+                            backgroundColor: 'rgba(217,119,6,0.15)',
+                            fill: true,
+                            tension: 0.3,
+                            pointRadius: 3,
+                            pointBackgroundColor: '#d97706',
+                            borderWidth: 2,
+                            data: chartData.D10
+                        },
+                        {
+                            label: 'D20 - Alligator Crack',
+                            borderColor: '#2563eb',
+                            backgroundColor: 'rgba(37,99,235,0.15)',
+                            fill: true,
+                            tension: 0.3,
+                            pointRadius: 3,
+                            pointBackgroundColor: '#2563eb',
+                            borderWidth: 2,
+                            data: chartData.D20
+                        },
+                        {
+                            label: 'D40 - Pothole',
+                            borderColor: '#7c3aed',
+                            backgroundColor: 'rgba(124,58,237,0.15)',
+                            fill: true,
+                            tension: 0.3,
+                            pointRadius: 3,
+                            pointBackgroundColor: '#7c3aed',
+                            borderWidth: 2,
+                            data: chartData.D40
+                        }
+                    ]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    animation: {
+                        duration: 300
+                    },
+                    scales: {
+                        x: {
+                            display: true,
+                            title: {
+                                display: true,
+                                text: 'Waktu (detik)',
+                                color: '#71717a',
+                                font: { size: 11 }
+                            },
+                            grid: { color: '#f4f4f5' },
+                            ticks: { color: '#71717a', font: { size: 10 } }
+                        },
+                        y: {
+                            beginAtZero: true,
+                            title: {
+                                display: true,
+                                text: 'Deteksi',
+                                color: '#71717a',
+                                font: { size: 11 }
+                            },
+                            grid: { color: '#e4e4e7' },
+                            ticks: { color: '#71717a', stepSize: 1, font: { size: 10 } }
+                        }
+                    },
+                    plugins: {
+                        legend: {
+                            position: 'bottom',
+                            labels: {
+                                color: '#52525b',
+                                usePointStyle: true,
+                                pointStyle: 'circle',
+                                padding: 20,
+                                font: { size: 11, weight: '500' }
+                            }
+                        },
+                        tooltip: {
+                            backgroundColor: 'rgba(24,24,27,0.9)',
+                            titleColor: '#fff',
+                            bodyColor: '#e4e4e7',
+                            padding: 12,
+                            cornerRadius: 6
+                        }
+                    },
+                    interaction: { intersect: false, mode: 'index' }
+                }
+            });
+        }
+
+        // Push chart data every 2 seconds
+        function startChartUpdates() {
+            let seconds = 0;
+            chartInterval = setInterval(() => {
+                if (!chart) return;
+                
+                seconds += 2;
+                
+                // Push directly to chart's data arrays
+                chart.data.labels.push(seconds + 's');
+                chart.data.datasets[0].data.push(pendingCounts.D00);
+                chart.data.datasets[1].data.push(pendingCounts.D10);
+                chart.data.datasets[2].data.push(pendingCounts.D20);
+                chart.data.datasets[3].data.push(pendingCounts.D40);
+                
+                // Log for debugging
+                console.log('[Chart] Update:', pendingCounts);
+                
+                // Reset pending counts
+                Object.keys(pendingCounts).forEach(k => pendingCounts[k] = 0);
+                
+                // Keep last 30 points
+                if (chart.data.labels.length > 30) {
+                    chart.data.labels.shift();
+                    chart.data.datasets.forEach(ds => ds.data.shift());
+                }
+                
+                chart.update('none');
+            }, 2000);
+        }
+
+        function stopChartUpdates() {
+            if (chartInterval) {
+                clearInterval(chartInterval);
+                chartInterval = null;
+            }
+        }
+
+        // Status
+        function setStatus(status, text) {
+            const badge = document.getElementById('statusBadge');
+            const txt = document.getElementById('statusText');
+            badge.dataset.status = status;
+            txt.textContent = text;
+        }
+
+        function formatTime(d) {
+            return d.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+        }
+
+        function formatDuration(ms) {
+            const s = Math.floor(ms / 1000) % 60;
+            const m = Math.floor(ms / 60000) % 60;
+            const h = Math.floor(ms / 3600000);
+            return `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
+        }
+
+        function genSessionId() {
+            return 'RDD-' + Date.now().toString(36).toUpperCase();
+        }
+
+        // Stream
+        async function startStreaming() {
+            try {
+                setStatus('connecting', 'Connecting...');
+
+                mediaStream = await navigator.mediaDevices.getUserMedia({
+                    video: { width: 1280, height: 720, facingMode: 'environment' },
+                    audio: false
+                });
+
+                localVideo.srcObject = mediaStream;
+                await new Promise(r => localVideo.onloadedmetadata = r);
+
+                captureCanvas.width = localVideo.videoWidth;
+                captureCanvas.height = localVideo.videoHeight;
+                document.getElementById('resolution').textContent = `${localVideo.videoWidth}×${localVideo.videoHeight}`;
+
+                const url = getWSUrl();
+                console.log('[WS] Connecting:', url);
+                websocket = new WebSocket(url);
+
+                websocket.onopen = () => {
+                    setStatus('online', 'Active');
+                    isStreaming = true;
+                    frameCount = 0;
+                    totalDetections = 0;
+                    startTime = Date.now();
+                    sessionId = genSessionId();
+
+                    Object.keys(classCounts).forEach(k => classCounts[k] = 0);
+                    updateCounts();
+
+                    document.getElementById('sessionId').textContent = sessionId;
+                    document.getElementById('sessionStart').textContent = formatTime(new Date());
+                    document.getElementById('startBtn').disabled = true;
+                    document.getElementById('stopBtn').disabled = false;
+
+                    captureInterval = setInterval(captureAndSend, 100);
+                    durationInterval = setInterval(updateDuration, 1000);
+                    startChartUpdates();
+                };
+
+                websocket.onmessage = e => handleResponse(JSON.parse(e.data));
+                websocket.onclose = () => { setStatus('offline', 'Disconnected'); stopStreaming(); };
+                websocket.onerror = () => setStatus('offline', 'Error');
+
+            } catch (err) {
+                console.error(err);
+                setStatus('offline', 'Error');
+            }
+        }
+
+        function stopStreaming() {
+            isStreaming = false;
+
+            if (captureInterval) clearInterval(captureInterval);
+            if (durationInterval) clearInterval(durationInterval);
+            stopChartUpdates();
+            if (websocket) websocket.close();
+            if (mediaStream) mediaStream.getTracks().forEach(t => t.stop());
+
+            localVideo.srcObject = null;
+            document.getElementById('startBtn').disabled = false;
+            document.getElementById('stopBtn').disabled = true;
+        }
+
+        function captureAndSend() {
+            if (!isStreaming || !websocket || websocket.readyState !== WebSocket.OPEN) return;
+
+            ctx.drawImage(localVideo, 0, 0);
+            const b64 = captureCanvas.toDataURL('image/jpeg', 0.8).split(',')[1];
+            websocket.send(b64);
+        }
+
+        function handleResponse(res) {
+            if (res.status !== 'success') return;
+
+            frameCount++;
+            document.getElementById('frameCount').textContent = frameCount;
+            document.getElementById('latency').innerHTML = `${res.processing_latency_ms.toFixed(0)}<small>ms</small>`;
+
+            const elapsed = (Date.now() - startTime) / 1000;
+            document.getElementById('fps').innerHTML = `${(frameCount / elapsed).toFixed(1)}<small>fps</small>`;
+
+            if (res.processed_frame) {
+                resultImage.src = res.processed_frame;
+            }
+
+            if (res.detections && res.detections.length > 0) {
+                totalDetections += res.detections.length;
+                document.getElementById('totalDetections').textContent = totalDetections;
+
+                res.detections.forEach(det => {
+                    const code = getClassCode(det.class);
+                    if (code && classCounts[code] !== undefined) {
+                        classCounts[code]++;
+                    }
+
+                    detectionHistory.push({
+                        frame: frameCount,
+                        timestamp: new Date().toISOString(),
+                        class: det.class,
+                        code: code,
+                        confidence: det.confidence,
+                        bbox: det.bbox
+                    });
+
+                    addLogItem(det, res.processed_frame);
+                    
+                    // Update pending chart data
+                    if (code && pendingCounts[code] !== undefined) {
+                        pendingCounts[code]++;
+                        console.log('[Detection] Received class:', det.class, '-> Code:', code, '| Count:', pendingCounts[code]);
+                    } else {
+                        console.warn('[Detection] Unknown class:', det.class);
+                    }
+                });
+
+                updateCounts();
+            }
+        }
+
+        function updateCounts() {
+            Object.keys(classCounts).forEach(cls => {
+                document.getElementById(`count${cls}`).textContent = classCounts[cls];
+            });
+        }
+
+        function updateDuration() {
+            if (startTime) {
+                document.getElementById('sessionDuration').textContent = formatDuration(Date.now() - startTime);
+            }
+        }
+
+        function addLogItem(det, img) {
+            const log = document.getElementById('detectionLog');
+            const empty = log.querySelector('.log-empty');
+            if (empty) empty.remove();
+
+            const item = document.createElement('div');
+            item.className = 'log-item';
+            item.innerHTML = `
+                <img class="log-thumb" src="${img}" alt="">
+                <div class="log-content">
+                    <div class="log-header">
+                        <span class="log-class">${det.class}</span>
+                        <span class="log-time">${formatTime(new Date())}</span>
+                    </div>
+                    <div class="log-meta">
+                        <span class="conf">${(det.confidence * 100).toFixed(1)}%</span> · Frame ${frameCount}
+                    </div>
+                </div>
+            `;
+
+            log.insertBefore(item, log.firstChild);
+
+            while (log.children.length > 50) {
+                log.removeChild(log.lastChild);
+            }
+        }
+
+        function clearChart() {
+            Object.keys(pendingCounts).forEach(k => pendingCounts[k] = 0);
+            if (chart) {
+                chart.data.labels.length = 0;
+                chart.data.datasets.forEach(ds => ds.data.length = 0);
+                chart.update('none');
+            }
+        }
+
+        function clearLog() {
+            document.getElementById('detectionLog').innerHTML = '<div class="log-empty">No detections yet</div>';
+        }
+
+        // Export
+        function exportJSON() {
+            const data = {
+                session_id: sessionId,
+                start_time: startTime ? new Date(startTime).toISOString() : null,
+                total_frames: frameCount,
+                total_detections: totalDetections,
+                class_summary: classCounts,
+                detections: detectionHistory
+            };
+
+            const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+            download(blob, `rdd-${sessionId || 'export'}.json`);
+        }
+
+        function exportCSV() {
+            const headers = ['Frame', 'Timestamp', 'Class', 'Confidence', 'X1', 'Y1', 'X2', 'Y2'];
+            const rows = detectionHistory.map(d => [
+                d.frame,
+                d.timestamp,
+                d.class,
+                d.confidence.toFixed(4),
+                ...d.bbox.map(v => v.toFixed(2))
+            ]);
+
+            const csv = [headers.join(','), ...rows.map(r => r.join(','))].join('\n');
+            const blob = new Blob([csv], { type: 'text/csv' });
+            download(blob, `rdd-${sessionId || 'export'}.csv`);
+        }
+
+        function download(blob, name) {
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = name;
+            a.click();
+            URL.revokeObjectURL(url);
+        }
+
+        // Init
+        initChart();
+        fetchModels();
+    </script>
+</body>
+</html>
