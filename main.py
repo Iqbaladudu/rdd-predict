@@ -14,6 +14,7 @@ import torch
 from ultralytics import YOLO
 from utils.boto import upload_file
 from utils.cloudinary_uploader import upload_to_cloudinary
+import requests
 
 # Set device - use GPU if available
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -37,10 +38,35 @@ os.makedirs("static", exist_ok=True)
 # Mount static files for serving results
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
+# URL model
+url = "https://pub-0ccce103f38e4902912534cdb3973783.r2.dev/YOLOv8_Small_RDD.pt"
+local_filename = "YOLOv8_Small_RDD.pt"
+
+# Fungsi untuk download dengan progres bar
+def download_file(url, filename):
+    with requests.get(url, stream=True) as r:
+        r.raise_for_status()
+        total_size = int(r.headers.get('content-length', 0))
+        downloaded_size = 0
+
+        print(f"Mengunduh {filename} dari {url}...")
+        with open(filename, 'wb') as f:
+            for chunk in r.iter_content(chunk_size=8192):
+                if chunk:
+                    f.write(chunk)
+                    downloaded_size += len(chunk)
+                    progress = (downloaded_size / total_size) * 100 if total_size > 0 else 0
+                    print(f"\rProgres: {progress:.2f}% ({downloaded_size / (1024*1024):.2f} MB / {total_size / (1024*1024):.2f} MB)", end="")
+        print("\nDownload selesai!")
+
+# Download file
+download_file(url, local_filename)
+
+
 # Load model
 # This will download yolov8n.pt if not present on first use
 try:
-    model = YOLO("https://pub-0ccce103f38e4902912534cdb3973783.r2.dev/YOLOv8_Small_RDD.pt") 
+    model = YOLO(local_filename) 
 except Exception as e:
     print(f"Error loading model: {e}")
     # Fallback or re-raise
