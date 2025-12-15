@@ -1,0 +1,31 @@
+services:
+  rdd-predict:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: rdd-predict
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      - TZ=Asia/Jakarta
+    volumes:
+      # Mount uploads folder untuk persistent storage
+      - ./uploads:/code/uploads
+      # Mount models folder jika ingin update model tanpa rebuild
+      - ./models:/code/models
+    # Konfigurasi NVIDIA GPU
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [ gpu ]
+    # Health check untuk memastikan service berjalan
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:8000/docs" ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
