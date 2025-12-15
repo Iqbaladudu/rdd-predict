@@ -76,6 +76,10 @@ except Exception as e:
 def read_root():
     return {"message": "RDD Predict API is running"}
 
+@app.get("/ping")
+async def health_check():
+    return {"status": "healthy"}
+
 @app.post("/predict")
 async def predict_media(file: UploadFile = File(...)):
     # Generate unique ID for this request
