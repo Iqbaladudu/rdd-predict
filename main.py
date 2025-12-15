@@ -1,6 +1,7 @@
 import shutil
 import uuid
 import os
+import logging
 from pathlib import Path
 from typing import List, Union
 
@@ -18,24 +19,42 @@ from utils.stream_utils import encode_frame_to_base64, decode_base64_to_frame
 import requests
 import time
 
+# Configure logging
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s | %(levelname)-8s | %(funcName)s:%(lineno)d | %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger(__name__)
+
 # Device detection - prioritize GPU if available
 def get_device():
     """Detect and return the best available device."""
+    logger.info("[STEP] Detecting available device...")
     if torch.cuda.is_available():
+        # Check for minimum required CUDA version for TensorRT
+        cuda_version_str = torch.version.cuda
+        if cuda_version_str and float(cuda_version_str.split('.')[0]) < 11:
+            logger.warning(f"⚠️  PyTorch CUDA version {cuda_version_str} is too old for TensorRT models.")
+            logger.warning("   Falling back to CPU. Please upgrade NVIDIA drivers and CUDA.")
+            return 'cpu'
+            
         device = 'cuda'
         gpu_name = torch.cuda.get_device_name(0)
         gpu_memory = torch.cuda.get_device_properties(0).total_memory / (1024**3)
-        print(f"🚀 GPU detected: {gpu_name} ({gpu_memory:.1f} GB)")
-        print(f"   CUDA version: {torch.version.cuda}")
+        logger.info(f"🚀 GPU detected: {gpu_name} ({gpu_memory:.1f} GB)")
+        logger.info(f"   CUDA version: {torch.version.cuda}")
+        logger.debug(f"[STEP] Device detection complete: {device}")
         return device
     else:
-        print("⚠️  No GPU detected, using CPU")
-        print("   TensorRT models will NOT be available")
+        logger.warning("⚠️  No GPU detected, using CPU")
+        logger.warning("   TensorRT models will NOT be available")
+        logger.debug("[STEP] Device detection complete: cpu")
         return 'cpu'
 
 DEVICE = get_device()
 HAS_GPU = DEVICE == 'cuda'
-print(f"Using device: {DEVICE}")
+logger.info(f"[STEP] Using device: {DEVICE}")
 
 app = FastAPI()
 
@@ -59,13 +78,14 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 # Format: {endpoint_suffix: {"url": url, "local_path": path, "description": desc, "requires_gpu": bool}}
 
 # Check TensorFlow availability for TFLite models
+logger.info("[STEP] Checking TensorFlow availability...")
 try:
     import tensorflow
     HAS_TENSORFLOW = True
-    print(f"✅ TensorFlow available: {tensorflow.__version__}")
+    logger.info(f"✅ TensorFlow available: {tensorflow.__version__}")
 except ImportError:
     HAS_TENSORFLOW = False
-    print("⚠️  TensorFlow not installed - TFLite models will NOT be available")
+    logger.warning("⚠️  TensorFlow not installed - TFLite models will NOT be available")
 
 MODEL_CONFIGS = {
     "tfrt-32": {
@@ -111,28 +131,50 @@ os.makedirs("models", exist_ok=True)
 # Fungsi untuk download dengan progres bar
 def download_file(url: str, filename: str) -> bool:
     """Download file with progress bar. Returns True if successful."""
+    logger.info(f"[STEP] download_file() called for: {filename}")
+    logger.debug(f"[STEP] Checking if file exists: {filename}")
+    
     if os.path.exists(filename):
-        print(f"[Download] {filename} sudah ada, skip download.")
+        logger.info(f"[Download] {filename} sudah ada, skip download.")
         return True
     
     try:
+        logger.debug(f"[STEP] Starting HTTP request to: {url}")
         with requests.get(url, stream=True, timeout=30) as r:
+            logger.debug(f"[STEP] HTTP response status: {r.status_code}")
             r.raise_for_status()
             total_size = int(r.headers.get('content-length', 0))
             downloaded_size = 0
 
-            print(f"[Download] Mengunduh {filename} dari {url}...")
+            logger.info(f"[Download] Mengunduh {filename} dari {url}...")
+            logger.debug(f"[STEP] Total file size: {total_size / (1024*1024):.2f} MB")
+            
             with open(filename, 'wb') as f:
                 for chunk in r.iter_content(chunk_size=8192):
                     if chunk:
                         f.write(chunk)
                         downloaded_size += len(chunk)
                         progress = (downloaded_size / total_size) * 100 if total_size > 0 else 0
+                        # Log every 10% progress
+                        if int(progress) % 10 == 0:
+                            logger.debug(f"[Download] Progress: {progress:.2f}%")
                         print(f"\r[Download] Progres: {progress:.2f}% ({downloaded_size / (1024*1024):.2f} MB / {total_size / (1024*1024):.2f} MB)", end="")
+            
             print("\n[Download] Download selesai!")
+            logger.info(f"[STEP] Download complete: {filename}")
             return True
+    except requests.exceptions.Timeout as e:
+        logger.error(f"[Download] Timeout error downloading {filename}: {e}")
+        if os.path.exists(filename):
+            os.remove(filename)
+        return False
+    except requests.exceptions.HTTPError as e:
+        logger.error(f"[Download] HTTP error downloading {filename}: {e}")
+        if os.path.exists(filename):
+            os.remove(filename)
+        return False
     except Exception as e:
-        print(f"\n[Download] Error downloading {filename}: {e}")
+        logger.exception(f"[Download] Unexpected error downloading {filename}: {e}")
         if os.path.exists(filename):
             os.remove(filename)
         return False
@@ -142,9 +184,9 @@ models: dict = {}
 
 def load_all_models():
     """Download and load all models at startup."""
-    print("\n" + "="*60)
-    print("LOADING ALL MODELS")
-    print("="*60 + "\n")
+    logger.info("[STEP] " + "="*50)
+    logger.info("[STEP] LOADING ALL MODELS")
+    logger.info("[STEP] " + "="*50)
     
     for model_key, config in MODEL_CONFIGS.items():
         url = config["url"]
@@ -153,43 +195,53 @@ def load_all_models():
         requires_gpu = config.get("requires_gpu", False)
         requires_tensorflow = config.get("requires_tensorflow", False)
         
-        print(f"\n[Model] Loading {model_key} ({description})...")
+        logger.info(f"[STEP] Processing model: {model_key} ({description})")
+        logger.debug(f"[STEP] Model config: url={url}, path={local_path}, gpu={requires_gpu}, tf={requires_tensorflow}")
         
         # Skip GPU-only models if no GPU available
         if requires_gpu and not HAS_GPU:
-            print(f"[Model] SKIP: {model_key} requires GPU (TensorRT)")
+            logger.warning(f"[Model] SKIP: {model_key} requires GPU (TensorRT)")
             continue
         
         # Skip TFLite models if TensorFlow not available
         if requires_tensorflow and not HAS_TENSORFLOW:
-            print(f"[Model] SKIP: {model_key} requires TensorFlow (TFLite)")
+            logger.warning(f"[Model] SKIP: {model_key} requires TensorFlow (TFLite)")
             continue
         
         # Download if URL is provided and file doesn't exist
         if url and not os.path.exists(local_path):
+            logger.info(f"[STEP] Downloading model: {model_key}")
             success = download_file(url, local_path)
             if not success:
-                print(f"[Model] SKIP: Failed to download {model_key}")
+                logger.error(f"[Model] SKIP: Failed to download {model_key}")
                 continue
         
         # Check if local file exists
         if not os.path.exists(local_path):
-            print(f"[Model] SKIP: {local_path} not found")
+            logger.warning(f"[Model] SKIP: {local_path} not found")
             continue
         
         # Load model
         try:
+            logger.info(f"[STEP] Loading YOLO model from: {local_path}")
             model = YOLO(local_path)
             models[model_key] = model
-            print(f"[Model] SUCCESS: {model_key} loaded from {local_path}")
+            logger.info(f"[Model] SUCCESS: {model_key} loaded from {local_path}")
         except Exception as e:
-            print(f"[Model] ERROR: Failed to load {model_key}: {e}")
+            # Handle TensorRT/CUDA initialization failures gracefully
+            error_msg = str(e).lower()
+            if "cuda" in error_msg or "tensorrt" in error_msg or "segmentation fault" in error_msg:
+                logger.error(f"[Model] SKIP: {model_key} - CUDA/TensorRT initialization failed")
+                logger.error(f"         This usually means GPU drivers are incompatible or missing.")
+                logger.exception(f"         Error details: {e}")
+            else:
+                logger.exception(f"[Model] ERROR: Failed to load {model_key}: {e}")
     
-    print("\n" + "="*60)
-    print(f"LOADED MODELS: {list(models.keys())}")
+    logger.info("[STEP] " + "="*50)
+    logger.info(f"[STEP] LOADED MODELS: {list(models.keys())}")
     if HAS_GPU:
-        print(f"GPU READY: TensorRT models available for acceleration")
-    print("="*60 + "\n")
+        logger.info("[STEP] GPU READY: TensorRT models available for acceleration")
+    logger.info("[STEP] " + "="*50)
 
 # Load all models at startup
 load_all_models()
@@ -250,32 +302,43 @@ async def handle_stream_prediction(websocket: WebSocket, model_key: str, selecte
         "detection_count": int
     }
     """
+    logger.info(f"[STEP] handle_stream_prediction() called for model: {model_key}")
+    logger.debug(f"[STEP] Accepting WebSocket connection...")
     await websocket.accept()
     frame_index = 0
     
-    print(f"[Stream:{model_key}] Client connected")
+    logger.info(f"[Stream:{model_key}] Client connected")
     
     try:
         while True:
             # Receive frame from client
+            logger.debug(f"[STEP] Waiting for frame {frame_index} from client...")
             data = await websocket.receive_text()
             start_time = time.time()
+            logger.debug(f"[STEP] Received frame data, size: {len(data)} bytes")
             
             try:
                 # Decode base64 frame
+                logger.debug(f"[STEP] Decoding base64 frame...")
                 frame = decode_base64_to_frame(data)
+                logger.debug(f"[STEP] Frame decoded, shape: {frame.shape if frame is not None else 'None'}")
                 
                 # Run YOLO prediction with selected model
+                logger.debug(f"[STEP] Running YOLO prediction on device: {DEVICE}")
                 results = selected_model(frame, device=DEVICE, verbose=False)
                 result = results[0]
+                logger.debug(f"[STEP] Prediction complete, boxes: {len(result.boxes)}")
                 
                 # Get annotated frame
+                logger.debug(f"[STEP] Plotting annotated frame...")
                 annotated_frame = result.plot()
                 
                 # Encode processed frame to base64
+                logger.debug(f"[STEP] Encoding frame to base64...")
                 processed_frame_b64 = encode_frame_to_base64(annotated_frame)
                 
                 # Extract detection data
+                logger.debug(f"[STEP] Extracting detection data...")
                 detections = []
                 for box in result.boxes:
                     c = int(box.cls)
@@ -292,6 +355,7 @@ async def handle_stream_prediction(websocket: WebSocket, model_key: str, selecte
                 processing_latency = (time.time() - start_time) * 1000
                 
                 # Send response
+                logger.debug(f"[STEP] Preparing response JSON...")
                 response = {
                     "status": "success",
                     "model": model_key,
@@ -304,15 +368,17 @@ async def handle_stream_prediction(websocket: WebSocket, model_key: str, selecte
                 }
                 
                 # Log to terminal
-                print(f"[Stream:{model_key}] Frame {frame_index:04d} | "
+                logger.info(f"[Stream:{model_key}] Frame {frame_index:04d} | "
                       f"Detections: {len(detections):2d} | "
                       f"Latency: {processing_latency:6.2f}ms | "
                       f"Classes: {[d['class'] for d in detections]}")
                 
+                logger.debug(f"[STEP] Sending response to client...")
                 await websocket.send_json(response)
                 frame_index += 1
                 
             except ValueError as e:
+                logger.error(f"[STEP] ValueError processing frame: {e}")
                 # Invalid frame data
                 await websocket.send_json({
                     "status": "error",
@@ -322,23 +388,24 @@ async def handle_stream_prediction(websocket: WebSocket, model_key: str, selecte
                 })
                 
     except WebSocketDisconnect:
-        print(f"[Stream:{model_key}] WebSocket disconnected after {frame_index} frames")
+        logger.info(f"[Stream:{model_key}] WebSocket disconnected after {frame_index} frames")
     except Exception as e:
-        print(f"[Stream:{model_key}] WebSocket error: {e}")
+        logger.exception(f"[Stream:{model_key}] WebSocket error: {e}")
         try:
             await websocket.send_json({
                 "status": "error",
                 "model": model_key,
                 "error": str(e)
             })
-        except:
-            pass
+        except Exception as send_error:
+            logger.error(f"[STEP] Failed to send error response: {send_error}")
 
 
 # Default stream endpoint (uses default model)
 @app.websocket("/predict/stream")
 async def predict_stream_default(websocket: WebSocket):
     """Default stream endpoint using the default model (pytorch or first available)."""
+    logger.info("[STEP] predict_stream_default() endpoint called")
     await handle_stream_prediction(websocket, "default", model)
 
 
@@ -355,7 +422,10 @@ async def predict_stream_model(websocket: WebSocket, model_key: str):
     - /predict/stream/tflite-16 : TFLite Float16
     - /predict/stream/pytorch : PyTorch Original
     """
+    logger.info(f"[STEP] predict_stream_model() endpoint called for model: {model_key}")
+    
     if model_key not in models:
+        logger.error(f"[STEP] Model not found: {model_key}. Available: {list(models.keys())}")
         await websocket.accept()
         await websocket.send_json({
             "status": "error",
@@ -365,51 +435,71 @@ async def predict_stream_model(websocket: WebSocket, model_key: str):
         return
     
     selected_model = models[model_key]
+    logger.debug(f"[STEP] Selected model: {model_key}")
     await handle_stream_prediction(websocket, model_key, selected_model)
 
 
 @app.post("/predict")
 async def predict_media(file: UploadFile = File(...)):
+    logger.info("[STEP] predict_media() endpoint called")
+    
     # Generate unique ID for this request
     result_type = None
     request_id = str(uuid.uuid4())
     filename = file.filename
+    logger.info(f"[STEP] Processing file: {filename}, request_id: {request_id}")
+    
     # Handle cases where filename might be empty or missing extension
     if not filename or "." not in filename:
+        logger.error(f"[STEP] Invalid filename: {filename}")
         raise HTTPException(status_code=400, detail="Invalid filename")
         
     extension = filename.split(".")[-1].lower()
+    logger.debug(f"[STEP] File extension: {extension}")
     
     # Paths
     input_path = Path(f"uploads/{request_id}.{extension}")
     output_filename = f"{request_id}_processed.{extension}"
     output_path = Path(f"static/{output_filename}")
+    logger.debug(f"[STEP] Input path: {input_path}, Output path: {output_path}")
     
     # Save uploaded file
+    logger.info(f"[STEP] Saving uploaded file to: {input_path}")
     with open(input_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
+    logger.debug(f"[STEP] File saved successfully")
         
     results_data = []
     video_metadata = {}
     
     try:
         if extension in ["jpg", "jpeg", "png", "bmp", "webp"]:
+            logger.info(f"[STEP] Processing as IMAGE: {extension}")
             result_type = "image"
             # Process Image
+            logger.debug(f"[STEP] Running YOLO model on image...")
             results = model(input_path, device=DEVICE)
             result = results[0]
+            logger.debug(f"[STEP] YOLO prediction complete, detections: {len(result.boxes)}")
             
             # Save annotated image
+            logger.debug(f"[STEP] Plotting and saving annotated image...")
             annotated_frame = result.plot()
             cv2.imwrite(str(output_path), annotated_frame)
+            logger.info(f"[STEP] Annotated image saved to: {output_path}")
             
             # Upload to S3
+            logger.info(f"[STEP] Uploading to S3...")
             s3_url = upload_file(str(output_path), output_filename)
+            logger.debug(f"[STEP] S3 upload complete: {s3_url}")
             
             # Upload to Cloudinary
+            logger.info(f"[STEP] Uploading to Cloudinary...")
             cloudinary_result = upload_to_cloudinary(str(output_path))
+            logger.debug(f"[STEP] Cloudinary upload complete: {cloudinary_result.get('url')}")
             
             # Extract data
+            logger.debug(f"[STEP] Extracting detection data...")
             for box in result.boxes:
                 c = int(box.cls)
                 class_name = model.names[c]
@@ -420,18 +510,24 @@ async def predict_media(file: UploadFile = File(...)):
                     "confidence": conf,
                     "bbox": xyxy
                 })
+            logger.info(f"[STEP] Image processing complete, {len(results_data)} detections")
                 
         elif extension in ["mp4", "avi", "mov", "mkv", "webm"]:
+            logger.info(f"[STEP] Processing as VIDEO: {extension}")
             result_type = "video"
             # Process Video
+            logger.debug(f"[STEP] Opening video capture...")
             cap = cv2.VideoCapture(str(input_path))
             if not cap.isOpened():
+                logger.error(f"[STEP] Could not open video file: {input_path}")
                 raise HTTPException(status_code=400, detail="Could not open video file")
                 
             width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
             height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
             fps = cap.get(cv2.CAP_PROP_FPS)
             total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            
+            logger.info(f"[STEP] Video metadata: {width}x{height}, {fps} FPS, {total_frames} frames")
             
             video_metadata = {
                 "width": width,
@@ -441,6 +537,7 @@ async def predict_media(file: UploadFile = File(...)):
             }
             
             # Use mp4v for compatibility
+            logger.debug(f"[STEP] Initializing video writer...")
             fourcc = cv2.VideoWriter_fourcc(*'mp4v') 
             out = cv2.VideoWriter(str(output_path), fourcc, fps, (width, height))
             
@@ -448,9 +545,12 @@ async def predict_media(file: UploadFile = File(...)):
             while cap.isOpened():
                 success, frame = cap.read()
                 if not success:
+                    logger.debug(f"[STEP] Video read complete at frame {frame_idx}")
                     break
                     
                 # Run YOLO
+                if frame_idx % 100 == 0:
+                    logger.debug(f"[STEP] Processing frame {frame_idx}/{total_frames}")
                 results = model(frame, device=DEVICE)
                 result = results[0]
                 
@@ -472,12 +572,14 @@ async def predict_media(file: UploadFile = File(...)):
                     })
                 
                 if frame_detections:
+                    logger.debug(f"[STEP] Frame {frame_idx}: {len(frame_detections)} detections found")
                     # Save frame as image and upload to Cloudinary
                     frame_filename = f"{request_id}_frame_{frame_idx}.jpg"
                     frame_path = Path(f"static/{frame_filename}")
                     cv2.imwrite(str(frame_path), annotated_frame)
 
                     # Upload frame to Cloudinary
+                    logger.debug(f"[STEP] Uploading frame {frame_idx} to Cloudinary...")
                     frame_cloudinary_result = upload_to_cloudinary(str(frame_path))
 
                     # Clean up the frame file to save space
@@ -496,25 +598,35 @@ async def predict_media(file: UploadFile = File(...)):
                 
             cap.release()
             out.release()
+            logger.info(f"[STEP] Video processing complete, {frame_idx} frames processed")
 
             # Upload processed video to Cloudinary
+            logger.info(f"[STEP] Uploading processed video to Cloudinary...")
             cloudinary_result = upload_to_cloudinary(str(output_path))
+            logger.debug(f"[STEP] Video Cloudinary upload complete: {cloudinary_result.get('url')}")
             
         else:
+            logger.error(f"[STEP] Unsupported file type: {extension}")
             raise HTTPException(status_code=400, detail="Unsupported file type. Use image (jpg, png) or video (mp4, avi).")
             
+    except HTTPException:
+        raise
     except Exception as e:
-        # Log error?
-        print(f"Error processing: {e}")
+        logger.exception(f"[STEP] Error processing file: {e}")
         # Cleanup output if it exists and is partial?
         if os.path.exists(output_path):
              os.remove(output_path)
         raise HTTPException(status_code=500, detail=f"Processing error: {str(e)}")
     finally:
         # Cleanup input file
+        logger.debug(f"[STEP] Cleaning up input file: {input_path}")
         if os.path.exists(input_path):
             os.remove(input_path)
+            logger.debug(f"[STEP] Input file cleaned up")
 
+    logger.info(f"[STEP] Request {request_id} completed successfully")
+    logger.info(f"[STEP] Results: {len(results_data)} detections, Cloudinary URL: {cloudinary_result.get('url')}")
+    
     return {
         "status": "success",
         "file_url": f"/static/{output_filename}",
