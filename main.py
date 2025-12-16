@@ -56,6 +56,22 @@ DEVICE = get_device()
 HAS_GPU = DEVICE == 'cuda'
 logger.info(f"[STEP] Using device: {DEVICE}")
 
+# Load environment variables
+from dotenv import load_dotenv
+load_dotenv()
+
+# Streaming configuration from environment
+STREAM_CONFIG = {
+    "target_fps": int(os.getenv("STREAM_TARGET_FPS", "30")),
+    "max_pending_frames": int(os.getenv("STREAM_MAX_PENDING_FRAMES", "5")),
+    "camera_width": int(os.getenv("STREAM_CAMERA_WIDTH", "640")),
+    "camera_height": int(os.getenv("STREAM_CAMERA_HEIGHT", "480")),
+    "jpeg_quality_client": int(os.getenv("STREAM_JPEG_QUALITY_CLIENT", "50")),
+    "jpeg_quality_server": int(os.getenv("STREAM_JPEG_QUALITY_SERVER", "70")),
+    "yolo_imgsz": int(os.getenv("STREAM_YOLO_IMGSZ", "480")),
+}
+logger.info(f"[CONFIG] Streaming settings: {STREAM_CONFIG}")
+
 app = FastAPI()
 
 # Allow CORS
@@ -77,15 +93,15 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 # Model configurations
 # Format: {endpoint_suffix: {"url": url, "local_path": path, "description": desc, "requires_gpu": bool}}
 
-# Check TensorFlow availability for TFLite models
-logger.info("[STEP] Checking TensorFlow availability...")
+# Check ai_edge_litert availability for TFLite models
+logger.info("[STEP] Checking ai_edge_litert availability...")
 try:
-    import tensorflow
+    from ai_edge_litert.interpreter import Interpreter
     HAS_TENSORFLOW = True
-    logger.info(f"✅ TensorFlow available: {tensorflow.__version__}")
+    logger.info("✅ ai_edge_litert available for TFLite models")
 except ImportError:
     HAS_TENSORFLOW = False
-    logger.warning("⚠️  TensorFlow not installed - TFLite models will NOT be available")
+    logger.warning("⚠️  ai_edge_litert not installed - TFLite models will NOT be available")
 
 MODEL_CONFIGS = {
     "tfrt-32": {
@@ -282,6 +298,12 @@ async def list_models():
     }
 
 
+@app.get("/stream/config")
+async def get_stream_config():
+    """Get streaming configuration for the frontend."""
+    return STREAM_CONFIG
+
+
 async def handle_stream_prediction(websocket: WebSocket, model_key: str, selected_model):
     """
     Shared handler for real-time video streaming using WebSocket.
@@ -323,9 +345,9 @@ async def handle_stream_prediction(websocket: WebSocket, model_key: str, selecte
                 frame = decode_base64_to_frame(data)
                 logger.debug(f"[STEP] Frame decoded, shape: {frame.shape if frame is not None else 'None'}")
                 
-                # Run YOLO prediction with selected model
+                # Run YOLO prediction with selected model (imgsz from config for faster inference)
                 logger.debug(f"[STEP] Running YOLO prediction on device: {DEVICE}")
-                results = selected_model(frame, device=DEVICE, verbose=False)
+                results = selected_model(frame, device=DEVICE, verbose=False, imgsz=STREAM_CONFIG['yolo_imgsz'])
                 result = results[0]
                 logger.debug(f"[STEP] Prediction complete, boxes: {len(result.boxes)}")
                 
@@ -333,9 +355,9 @@ async def handle_stream_prediction(websocket: WebSocket, model_key: str, selecte
                 logger.debug(f"[STEP] Plotting annotated frame...")
                 annotated_frame = result.plot()
                 
-                # Encode processed frame to base64
+                # Encode processed frame to base64 (quality from config)
                 logger.debug(f"[STEP] Encoding frame to base64...")
-                processed_frame_b64 = encode_frame_to_base64(annotated_frame)
+                processed_frame_b64 = encode_frame_to_base64(annotated_frame, quality=STREAM_CONFIG['jpeg_quality_server'])
                 
                 # Extract detection data
                 logger.debug(f"[STEP] Extracting detection data...")

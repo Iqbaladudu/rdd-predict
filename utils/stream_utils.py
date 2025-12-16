@@ -6,7 +6,7 @@ import numpy as np
 import cv2
 
 
-def encode_frame_to_base64(frame: np.ndarray, quality: int = 85) -> str:
+def encode_frame_to_base64(frame: np.ndarray, quality: int = 70) -> str:
     """
     Encode OpenCV frame to base64 JPEG string.
     

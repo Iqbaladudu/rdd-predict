@@ -738,6 +738,26 @@
         const chartData = { D00: [], D10: [], D20: [], D40: [] };
         const pendingCounts = { D00: 0, D10: 0, D20: 0, D40: 0 };
         
+        // Smooth streaming variables
+        let animationFrameId = null;
+        let lastFrameTime = 0;
+        let targetFPS = 30; // Default, will be overwritten by server config
+        let frameDuration = 1000 / targetFPS;
+        let pendingFrames = 0; // Track frames waiting for response
+        let maxPendingFrames = 5; // Default, will be overwritten by server config
+        let frameBuffer = null; // Buffer for smooth image display
+        let lastDisplayedFrame = null;
+        let fpsTimestamps = []; // For accurate FPS calculation
+        
+        // Stream configuration (loaded from server)
+        let streamConfig = {
+            target_fps: 30,
+            max_pending_frames: 5,
+            camera_width: 640,
+            camera_height: 480,
+            jpeg_quality_client: 50
+        };
+        
         // Class name to code mapping
         const CLASS_TO_CODE = {
             // Standard codes
@@ -997,7 +1017,11 @@
                 setStatus('connecting', 'Connecting...');
 
                 mediaStream = await navigator.mediaDevices.getUserMedia({
-                    video: { width: 1280, height: 720, facingMode: 'environment' },
+                    video: { 
+                        width: streamConfig.camera_width, 
+                        height: streamConfig.camera_height, 
+                        facingMode: 'environment' 
+                    },
                     audio: false
                 });
 
@@ -1032,6 +1056,8 @@
                     totalDetections = 0;
                     startTime = Date.now();
                     sessionId = genSessionId();
+                    pendingFrames = 0;
+                    fpsTimestamps = [];
 
                     Object.keys(classCounts).forEach(k => classCounts[k] = 0);
                     updateCounts();
@@ -1041,7 +1067,10 @@
                     document.getElementById('startBtn').disabled = true;
                     document.getElementById('stopBtn').disabled = false;
 
-                    captureInterval = setInterval(captureAndSend, 100);
+                    // Use requestAnimationFrame for smooth capture
+                    lastFrameTime = performance.now();
+                    requestAnimationFrame(smoothCaptureLoop);
+                    
                     durationInterval = setInterval(updateDuration, 1000);
                     startChartUpdates();
                 };
@@ -1059,6 +1088,7 @@
         function stopStreaming() {
             isStreaming = false;
 
+            if (animationFrameId) cancelAnimationFrame(animationFrameId);
             if (captureInterval) clearInterval(captureInterval);
             if (durationInterval) clearInterval(durationInterval);
             stopChartUpdates();
@@ -1066,30 +1096,85 @@
             if (mediaStream) mediaStream.getTracks().forEach(t => t.stop());
 
             localVideo.srcObject = null;
+            pendingFrames = 0;
             document.getElementById('startBtn').disabled = false;
             document.getElementById('stopBtn').disabled = true;
         }
 
-        function captureAndSend() {
+        // Smooth capture loop using requestAnimationFrame
+        function smoothCaptureLoop(currentTime) {
+            if (!isStreaming) return;
+            
+            animationFrameId = requestAnimationFrame(smoothCaptureLoop);
+            
+            // Check if enough time has passed for next frame
+            const elapsed = currentTime - lastFrameTime;
+            if (elapsed < frameDuration) return;
+            
+            // Check if we have too many pending frames (back-pressure)
+            if (pendingFrames >= maxPendingFrames) {
+                return; // Skip this frame to prevent overwhelming the server
+            }
+            
+            lastFrameTime = currentTime - (elapsed % frameDuration);
+            captureAndSend();
+        }
+
+        async function captureAndSend() {
             if (!isStreaming || !websocket || websocket.readyState !== WebSocket.OPEN) return;
 
-            ctx.drawImage(localVideo, 0, 0);
-            const b64 = captureCanvas.toDataURL('image/jpeg', 0.8).split(',')[1];
-            websocket.send(b64);
+            try {
+                // GPU-accelerated: createImageBitmap is hardware-accelerated
+                const bitmap = await createImageBitmap(localVideo);
+                ctx.drawImage(bitmap, 0, 0);
+                bitmap.close(); // Release GPU resources
+                
+                // Encode to JPEG
+                const quality = streamConfig.jpeg_quality_client / 100;
+                const b64 = captureCanvas.toDataURL('image/jpeg', quality).split(',')[1];
+                websocket.send(b64);
+                pendingFrames++;
+            } catch (e) {
+                // Fallback to direct drawImage if createImageBitmap fails
+                ctx.drawImage(localVideo, 0, 0);
+                const quality = streamConfig.jpeg_quality_client / 100;
+                const b64 = captureCanvas.toDataURL('image/jpeg', quality).split(',')[1];
+                websocket.send(b64);
+                pendingFrames++;
+            }
         }
 
         function handleResponse(res) {
+            // Decrease pending frame counter
+            pendingFrames = Math.max(0, pendingFrames - 1);
+            
             if (res.status !== 'success') return;
 
             frameCount++;
             document.getElementById('frameCount').textContent = frameCount;
             document.getElementById('latency').innerHTML = `${res.processing_latency_ms.toFixed(0)}<small>ms</small>`;
 
-            const elapsed = (Date.now() - startTime) / 1000;
-            document.getElementById('fps').innerHTML = `${(frameCount / elapsed).toFixed(1)}<small>fps</small>`;
+            // Calculate accurate FPS using timestamp buffer
+            const now = Date.now();
+            fpsTimestamps.push(now);
+            // Keep only last 2 seconds of timestamps
+            while (fpsTimestamps.length > 0 && now - fpsTimestamps[0] > 2000) {
+                fpsTimestamps.shift();
+            }
+            if (fpsTimestamps.length > 1) {
+                const duration = (now - fpsTimestamps[0]) / 1000;
+                const fps = (fpsTimestamps.length - 1) / duration;
+                document.getElementById('fps').innerHTML = `${fps.toFixed(1)}<small>fps</small>`;
+            }
 
+            // Smooth image update using preloading
             if (res.processed_frame) {
-                resultImage.src = res.processed_frame;
+                // Preload the image to prevent flicker
+                const img = new Image();
+                img.onload = () => {
+                    resultImage.src = img.src;
+                };
+                img.src = res.processed_frame;
             }
 
             if (res.detections && res.detections.length > 0) {
@@ -1217,8 +1302,28 @@
             URL.revokeObjectURL(url);
         }
 
+        // Fetch stream config from server
+        async function fetchStreamConfig() {
+            try {
+                const res = await fetch(`${API_BASE}/stream/config`);
+                if (!res.ok) throw new Error(`HTTP ${res.status}`);
+                const config = await res.json();
+                
+                // Apply config
+                streamConfig = config;
+                targetFPS = config.target_fps || 30;
+                frameDuration = 1000 / targetFPS;
+                maxPendingFrames = config.max_pending_frames || 5;
+                
+                console.log('[Config] Loaded stream config:', streamConfig);
+            } catch (e) {
+                console.warn('[Config] Using default settings:', e.message);
+            }
+        }
+
         // Init
         initChart();
+        fetchStreamConfig();
         fetchModels();
     </script>
 </body>
