@@ -392,6 +392,12 @@ Standard streaming protocol menggunakan Base64 encoding.
 
 **Model Keys:** `pytorch`, `tfrt-32`, `tfrt-16`, `tflite-32`, `tflite-16`
 
+**Path Parameters:**
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `device_id` | `string` | Identifier unik untuk device/client |
+| `model_key` | `string` | Key model yang akan digunakan |
+
 #### Client → Server (Request)
 
 Kirim frame sebagai Base64 encoded JPEG string:
@@ -412,6 +418,7 @@ data:image/jpeg;base64,/9j/4AAQSkZJRgABAQEASABIAAD/2wBDAAMCAgMCAgMD...
 ```json
 {
   "device_id": "abc123",
+  "session_id": "a1b2c3d4e5f67890abcdef1234567890",
   "status": "success",
   "model": "pytorch",
   "frame_index": 42,
@@ -437,6 +444,7 @@ data:image/jpeg;base64,/9j/4AAQSkZJRgABAQEASABIAAD/2wBDAAMCAgMCAgMD...
 | Field | Type | Description |
 |-------|------|-------------|
 | `device_id` | `string` | Device ID dari URL parameter |
+| `session_id` | `string` | Session ID unik yang di-generate server untuk koneksi ini |
 | `status` | `string` | `"success"` atau `"error"` |
 | `model` | `string` | Model yang digunakan |
 | `frame_index` | `number` | Index frame (incremental) |
@@ -449,6 +457,8 @@ data:image/jpeg;base64,/9j/4AAQSkZJRgABAQEASABIAAD/2wBDAAMCAgMCAgMD...
 **Error Response:**
 ```json
 {
+  "device_id": "abc123",
+  "session_id": "a1b2c3d4e5f67890abcdef1234567890",
   "status": "error",
   "model": "pytorch",
   "frame_index": 42,
@@ -542,8 +552,14 @@ Binary streaming untuk performa lebih tinggi (~33% bandwidth reduction).
 
 | Endpoint | Description |
 |----------|-------------|
-| `ws://host/predict/stream-binary` | Default model |
-| `ws://host/predict/stream-binary/{model_key}` | Model spesifik |
+| `ws://host/predict/stream-binary/{device_id}` | Default model |
+| `ws://host/predict/stream-binary/{model_key}/{device_id}` | Model spesifik |
+
+**Path Parameters:**
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `device_id` | `string` | Identifier unik untuk device/client |
+| `model_key` | `string` | Key model yang akan digunakan |
 
 #### Client → Server (Request)
 
@@ -591,6 +607,8 @@ ws.onmessage = async (event) => {
 **Header JSON Format:**
 ```json
 {
+  "device_id": "my-device-001",
+  "session_id": "a1b2c3d4e5f67890abcdef1234567890",
   "status": "success",
   "model": "pytorch",
   "frame_index": 42,
@@ -611,13 +629,14 @@ ws.onmessage = async (event) => {
 
 ```javascript
 class RDDBinaryStreamClient {
-  constructor(modelKey = 'pytorch') {
+  constructor(modelKey = 'pytorch', deviceId = 'device-001') {
     this.modelKey = modelKey;
+    this.deviceId = deviceId;
     this.ws = null;
   }
 
   connect() {
-    const wsUrl = `ws://${location.host}/predict/stream-binary/${this.modelKey}`;
+    const wsUrl = `ws://${location.host}/predict/stream-binary/${this.modelKey}/${this.deviceId}`;
     this.ws = new WebSocket(wsUrl);
     this.ws.binaryType = 'arraybuffer';
 
@@ -803,8 +822,8 @@ ws.onclose = (event) => {
 | POST | `/predict` | Upload & process media |
 | WS | `/predict/stream/{device_id}` | Default stream |
 | WS | `/predict/stream/{model_key}/{device_id}` | Model-specific stream |
-| WS | `/predict/stream-binary` | Binary default stream |
-| WS | `/predict/stream-binary/{model_key}` | Binary model-specific stream |
+| WS | `/predict/stream-binary/{device_id}` | Binary default stream |
+| WS | `/predict/stream-binary/{model_key}/{device_id}` | Binary model-specific stream |
 
 ### Model Keys
 

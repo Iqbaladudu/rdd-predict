@@ -305,7 +305,7 @@ async def get_stream_config():
     return STREAM_CONFIG
 
 
-async def handle_stream_prediction(websocket: WebSocket, model_key: str, selected_model, device_id: str):
+async def handle_stream_prediction(websocket: WebSocket, model_key: str, selected_model, device_id: str, session_id: str):
     """
     Shared handler for real-time video streaming using WebSocket.
     
@@ -378,6 +378,7 @@ async def handle_stream_prediction(websocket: WebSocket, model_key: str, selecte
                 # Send response
                 response = {
                     "device_id": device_id,
+                    "session_id": session_id,
                     "status": "success",
                     "model": model_key,
                     "frame_index": frame_index,
@@ -401,6 +402,8 @@ async def handle_stream_prediction(websocket: WebSocket, model_key: str, selecte
                 logger.error(f"[STEP] ValueError processing frame: {e}")
                 # Invalid frame data
                 await websocket.send_json({
+                    "device_id": device_id,
+                    "session_id": session_id,
                     "status": "error",
                     "model": model_key,
                     "frame_index": frame_index,
@@ -413,6 +416,8 @@ async def handle_stream_prediction(websocket: WebSocket, model_key: str, selecte
         logger.exception(f"[Stream:{model_key}] WebSocket error: {e}")
         try:
             await websocket.send_json({
+                "device_id": device_id,
+                "session_id": session_id,
                 "status": "error",
                 "model": model_key,
                 "error": str(e)
@@ -446,7 +451,7 @@ def decode_bytes_to_frame(image_bytes: bytes) -> np.ndarray:
         raise ValueError(f"Invalid image data: {e}")
 
 
-async def handle_binary_stream_prediction(websocket: WebSocket, model_key: str, selected_model):
+async def handle_binary_stream_prediction(websocket: WebSocket, model_key: str, selected_model, device_id: str, session_id: str):
     """
     Binary protocol handler for high-performance video streaming.
     
@@ -512,6 +517,8 @@ async def handle_binary_stream_prediction(websocket: WebSocket, model_key: str, 
                 # Create JSON header (without frame data)
                 import json
                 header = {
+                    "device_id": device_id,
+                    "session_id": session_id,
                     "status": "success",
                     "model": model_key,
                     "frame_index": frame_index,
@@ -542,6 +549,8 @@ async def handle_binary_stream_prediction(websocket: WebSocket, model_key: str, 
                 # Send error as JSON text (fallback)
                 import json
                 await websocket.send_text(json.dumps({
+                    "device_id": device_id,
+                    "session_id": session_id,
                     "status": "error",
                     "model": model_key,
                     "frame_index": frame_index,
@@ -555,6 +564,8 @@ async def handle_binary_stream_prediction(websocket: WebSocket, model_key: str, 
         try:
             import json
             await websocket.send_text(json.dumps({
+                "device_id": device_id,
+                "session_id": session_id,
                 "status": "error",
                 "model": model_key,
                 "error": str(e)
@@ -569,31 +580,33 @@ async def predict_stream_default(websocket: WebSocket, device_id: str):
     """Default stream endpoint using the default model (pytorch or first available)."""
     logger.info("[STEP] predict_stream_default() endpoint called")
     session_id = secrets.token_hex(16)
-    print("session id", session_id)
-    await handle_stream_prediction(websocket, "default", model, device_id)
+    logger.info(f"[STEP] Created session_id: {session_id} for device_id: {device_id}")
+    await handle_stream_prediction(websocket, "default", model, device_id, session_id)
 
 
 # Dynamic stream endpoints for each loaded model
 @app.websocket("/predict/stream/{model_key}/{device_id}")
-async def predict_stream_model(websocket: WebSocket, model_key: str, device_id: int):
+async def predict_stream_model(websocket: WebSocket, model_key: str, device_id: str):
     """
     Model-specific stream endpoint.
     
     Available models:
-    - /predict/stream/tfrt-32 : TensorRT Float32
-    - /predict/stream/tfrt-16 : TensorRT Float16
-    - /predict/stream/tflite-32 : TFLite Float32
-    - /predict/stream/tflite-16 : TFLite Float16
-    - /predict/stream/pytorch : PyTorch Original
+    - /predict/stream/tfrt-32/{device_id} : TensorRT Float32
+    - /predict/stream/tfrt-16/{device_id} : TensorRT Float16
+    - /predict/stream/tflite-32/{device_id} : TFLite Float32
+    - /predict/stream/tflite-16/{device_id} : TFLite Float16
+    - /predict/stream/pytorch/{device_id} : PyTorch Original
     """
     session_id = secrets.token_hex(16)
-    print("session id", session_id)
+    logger.info(f"[STEP] Created session_id: {session_id} for device_id: {device_id}")
     logger.info(f"[STEP] predict_stream_model() endpoint called for model: {model_key}")
     
     if model_key not in models:
         logger.error(f"[STEP] Model not found: {model_key}. Available: {list(models.keys())}")
         await websocket.accept()
         await websocket.send_json({
+            "device_id": device_id,
+            "session_id": session_id,
             "status": "error",
             "error": f"Model '{model_key}' not loaded. Available models: {list(models.keys())}"
         })
@@ -602,22 +615,24 @@ async def predict_stream_model(websocket: WebSocket, model_key: str, device_id: 
     
     selected_model = models[model_key]
     logger.debug(f"[STEP] Selected model: {model_key}")
-    await handle_stream_prediction(websocket, model_key, device_id)
+    await handle_stream_prediction(websocket, model_key, selected_model, device_id, session_id)
 
 
 # Binary stream endpoints (high-performance, ~33% bandwidth reduction)
-@app.websocket("/predict/stream-binary")
-async def predict_stream_binary_default(websocket: WebSocket):
+@app.websocket("/predict/stream-binary/{device_id}")
+async def predict_stream_binary_default(websocket: WebSocket, device_id: str):
     """
     Default binary stream endpoint for high-performance video streaming.
     Uses raw JPEG bytes instead of base64, reducing bandwidth by ~33%.
     """
     logger.info("[STEP] predict_stream_binary_default() endpoint called")
-    await handle_binary_stream_prediction(websocket, "default", model)
+    session_id = secrets.token_hex(16)
+    logger.info(f"[STEP] Created session_id: {session_id} for device_id: {device_id}")
+    await handle_binary_stream_prediction(websocket, "default", model, device_id, session_id)
 
 
-@app.websocket("/predict/stream-binary/{model_key}")
-async def predict_stream_binary_model(websocket: WebSocket, model_key: str):
+@app.websocket("/predict/stream-binary/{model_key}/{device_id}")
+async def predict_stream_binary_model(websocket: WebSocket, model_key: str, device_id: str):
     """
     Model-specific binary stream endpoint for high-performance video streaming.
     
@@ -626,14 +641,14 @@ async def predict_stream_binary_model(websocket: WebSocket, model_key: str):
     - Server returns: [4-byte header length] + [JSON header] + [JPEG bytes]
     
     Available models:
-    - /predict/stream-binary/tfrt-32 : TensorRT Float32
-    - /predict/stream-binary/tfrt-16 : TensorRT Float16
-    - /predict/stream-binary/tflite-32 : TFLite Float32
-    - /predict/stream-binary/tflite-16 : TFLite Float16
-    - /predict/stream-binary/pytorch : PyTorch Original
+    - /predict/stream-binary/tfrt-32/{device_id} : TensorRT Float32
+    - /predict/stream-binary/tfrt-16/{device_id} : TensorRT Float16
+    - /predict/stream-binary/tflite-32/{device_id} : TFLite Float32
+    - /predict/stream-binary/tflite-16/{device_id} : TFLite Float16
+    - /predict/stream-binary/pytorch/{device_id} : PyTorch Original
     """
     session_id = secrets.token_hex(16)
-    logger.info(f"[STEP] session id: {session_id}")
+    logger.info(f"[STEP] Created session_id: {session_id} for device_id: {device_id}")
     logger.info(f"[STEP] predict_stream_binary_model() endpoint called for model: {model_key}")
     
     if model_key not in models:
@@ -641,6 +656,8 @@ async def predict_stream_binary_model(websocket: WebSocket, model_key: str):
         await websocket.accept()
         import json
         await websocket.send_text(json.dumps({
+            "device_id": device_id,
+            "session_id": session_id,
             "status": "error",
             "error": f"Model '{model_key}' not loaded. Available models: {list(models.keys())}"
         }))
@@ -649,7 +666,7 @@ async def predict_stream_binary_model(websocket: WebSocket, model_key: str):
     
     selected_model = models[model_key]
     logger.debug(f"[STEP] Selected model: {model_key}")
-    await handle_binary_stream_prediction(websocket, model_key, selected_model)
+    await handle_binary_stream_prediction(websocket, model_key, selected_model, device_id, session_id)
 
 
 @app.post("/predict")
