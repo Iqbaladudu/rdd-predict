@@ -589,7 +589,9 @@
                     <span class="video-label live">Camera</span>
                 </div>
                 <div class="video-card">
-                    <img id="resultImage" alt="Detection">
+                    <!-- Use canvas for GPU-accelerated rendering instead of img -->
+                    <canvas id="resultCanvas" style="width: 100%; height: 100%; object-fit: contain;"></canvas>
+                    <img id="resultImage" alt="Detection" style="display: none;">
                     <span class="video-label">Processed</span>
                 </div>
             </div>
@@ -758,6 +760,23 @@
             jpeg_quality_client: 50
         };
         
+        // WebCodecs & Binary Protocol Support
+        let useBinaryProtocol = true; // Use binary instead of base64
+        let useOffscreenCanvas = true; // Use OffscreenCanvas for GPU-accelerated capture
+        let offscreenCanvas = null;
+        let offscreenCtx = null;
+        
+        // Double-buffering for smooth display
+        let displayBuffer = []; // Frame buffer queue
+        const MAX_DISPLAY_BUFFER = 3;
+        let resultCanvasCtx = null;
+        let isRenderingFrame = false;
+        
+        // Performance metrics
+        let lastFrameReceiveTime = 0;
+        let frameTimings = [];
+        const MAX_FRAME_TIMINGS = 60;
+        
         // Class name to code mapping
         const CLASS_TO_CODE = {
             // Standard codes
@@ -790,9 +809,40 @@
         // DOM
         const localVideo = document.getElementById('localVideo');
         const resultImage = document.getElementById('resultImage');
+        const resultCanvas = document.getElementById('resultCanvas');
         const captureCanvas = document.getElementById('captureCanvas');
         const ctx = captureCanvas.getContext('2d');
         const modelSelect = document.getElementById('modelSelect');
+        
+        // Initialize result canvas context (will be set after video dimensions are known)
+        function initResultCanvas(width, height) {
+            resultCanvas.width = width;
+            resultCanvas.height = height;
+            resultCanvasCtx = resultCanvas.getContext('2d', { 
+                alpha: false, // Disable alpha for better performance
+                desynchronized: true // Non-blocking canvas operations
+            });
+            console.log('[Canvas] Result canvas initialized:', width, 'x', height);
+        }
+        
+        // Initialize OffscreenCanvas for GPU-accelerated capture
+        function initOffscreenCanvas(width, height) {
+            if (typeof OffscreenCanvas !== 'undefined' && useOffscreenCanvas) {
+                try {
+                    offscreenCanvas = new OffscreenCanvas(width, height);
+                    offscreenCtx = offscreenCanvas.getContext('2d', {
+                        alpha: false,
+                        willReadFrequently: false
+                    });
+                    console.log('[WebCodecs] OffscreenCanvas initialized:', width, 'x', height);
+                    return true;
+                } catch (e) {
+                    console.warn('[WebCodecs] OffscreenCanvas not available, using regular canvas');
+                    useOffscreenCanvas = false;
+                }
+            }
+            return false;
+        }
 
         // Fetch models
         async function fetchModels() {
@@ -838,8 +888,13 @@
             console.log('[Model]', selectedModel || 'default');
         });
 
+        // WebSocket URL functions
         function getWSUrl() {
             return selectedModel ? `${WS_BASE}/predict/stream/${selectedModel}` : `${WS_BASE}/predict/stream`;
+        }
+        
+        function getBinaryWSUrl() {
+            return selectedModel ? `${WS_BASE}/predict/stream-binary/${selectedModel}` : `${WS_BASE}/predict/stream-binary`;
         }
 
         // Chart initialization
@@ -1041,15 +1096,42 @@
                     console.warn('[Video] Autoplay blocked, user interaction may be needed:', playErr);
                 }
 
-                captureCanvas.width = localVideo.videoWidth;
-                captureCanvas.height = localVideo.videoHeight;
-                document.getElementById('resolution').textContent = `${localVideo.videoWidth}×${localVideo.videoHeight}`;
+                const videoWidth = localVideo.videoWidth;
+                const videoHeight = localVideo.videoHeight;
+                
+                // Initialize canvases
+                captureCanvas.width = videoWidth;
+                captureCanvas.height = videoHeight;
+                initResultCanvas(videoWidth, videoHeight);
+                initOffscreenCanvas(videoWidth, videoHeight);
+                
+                document.getElementById('resolution').textContent = `${videoWidth}×${videoHeight}`;
+                
+                // Clear display buffer
+                displayBuffer = [];
+                isRenderingFrame = false;
 
-                const url = getWSUrl();
-                console.log('[WS] Connecting:', url);
+                // Try binary endpoint first, fallback to regular
+                let url;
+                let usingBinary = false;
+                
+                if (useBinaryProtocol) {
+                    url = getBinaryWSUrl();
+                    console.log('[WS] Trying binary protocol:', url);
+                } else {
+                    url = getWSUrl();
+                    console.log('[WS] Using base64 protocol:', url);
+                }
+                
                 websocket = new WebSocket(url);
+                
+                // Set binary type for receiving binary data
+                websocket.binaryType = 'arraybuffer';
 
                 websocket.onopen = () => {
+                    usingBinary = useBinaryProtocol;
+                    console.log('[WS] Connected, binary mode:', usingBinary);
+                    
                     setStatus('online', 'Active');
                     isStreaming = true;
                     frameCount = 0;
@@ -1058,6 +1140,7 @@
                     sessionId = genSessionId();
                     pendingFrames = 0;
                     fpsTimestamps = [];
+                    frameTimings = [];
 
                     Object.keys(classCounts).forEach(k => classCounts[k] = 0);
                     updateCounts();
@@ -1071,17 +1154,77 @@
                     lastFrameTime = performance.now();
                     requestAnimationFrame(smoothCaptureLoop);
                     
+                    // Start display render loop for smooth frame display
+                    requestAnimationFrame(displayRenderLoop);
+                    
                     durationInterval = setInterval(updateDuration, 1000);
                     startChartUpdates();
                 };
 
-                websocket.onmessage = e => handleResponse(JSON.parse(e.data));
-                websocket.onclose = () => { setStatus('offline', 'Disconnected'); stopStreaming(); };
-                websocket.onerror = () => setStatus('offline', 'Error');
+                websocket.onmessage = e => {
+                    if (e.data instanceof ArrayBuffer) {
+                        // Binary protocol: parse MessagePack-like format
+                        handleBinaryResponse(e.data);
+                    } else {
+                        // JSON fallback (base64 protocol)
+                        handleResponse(JSON.parse(e.data));
+                    }
+                };
+                
+                websocket.onclose = (e) => { 
+                    console.log('[WS] Disconnected, code:', e.code);
+                    // If binary endpoint failed, fallback to regular
+                    if (useBinaryProtocol && e.code === 1006 && !isStreaming) {
+                        console.log('[WS] Binary endpoint not available, falling back to base64');
+                        useBinaryProtocol = false;
+                        startStreaming(); // Retry with base64
+                        return;
+                    }
+                    setStatus('offline', 'Disconnected'); 
+                    stopStreaming(); 
+                };
+                websocket.onerror = (e) => {
+                    console.error('[WS] Error:', e);
+                    setStatus('offline', 'Error');
+                };
 
             } catch (err) {
                 console.error(err);
                 setStatus('offline', 'Error');
+            }
+        }
+        
+        // Display render loop for smooth frame updates using double-buffering
+        function displayRenderLoop(timestamp) {
+            if (!isStreaming) return;
+            
+            requestAnimationFrame(displayRenderLoop);
+            
+            // Render next frame from buffer if available
+            if (displayBuffer.length > 0 && !isRenderingFrame && resultCanvasCtx) {
+                isRenderingFrame = true;
+                const frameData = displayBuffer.shift();
+                
+                // Use createImageBitmap for GPU-accelerated rendering
+                createImageBitmap(frameData.blob).then(bitmap => {
+                    resultCanvasCtx.drawImage(bitmap, 0, 0);
+                    bitmap.close();
+                    isRenderingFrame = false;
+                    
+                    // Track frame timing for jitter analysis
+                    const now = performance.now();
+                    if (lastFrameReceiveTime > 0) {
+                        const delta = now - lastFrameReceiveTime;
+                        frameTimings.push(delta);
+                        if (frameTimings.length > MAX_FRAME_TIMINGS) {
+                            frameTimings.shift();
+                        }
+                    }
+                    lastFrameReceiveTime = now;
+                }).catch(e => {
+                    console.warn('[Display] Bitmap decode failed:', e);
+                    isRenderingFrame = false;
+                });
             }
         }
 
@@ -1126,21 +1269,60 @@
             try {
                 // GPU-accelerated: createImageBitmap is hardware-accelerated
                 const bitmap = await createImageBitmap(localVideo);
-                ctx.drawImage(bitmap, 0, 0);
+                
+                // Use OffscreenCanvas if available (faster, off main thread)
+                const targetCanvas = useOffscreenCanvas && offscreenCanvas ? offscreenCanvas : captureCanvas;
+                const targetCtx = useOffscreenCanvas && offscreenCtx ? offscreenCtx : ctx;
+                
+                targetCtx.drawImage(bitmap, 0, 0);
                 bitmap.close(); // Release GPU resources
                 
-                // Encode to JPEG
                 const quality = streamConfig.jpeg_quality_client / 100;
-                const b64 = captureCanvas.toDataURL('image/jpeg', quality).split(',')[1];
-                websocket.send(b64);
+                
+                if (useBinaryProtocol) {
+                    // Binary protocol: send raw JPEG bytes (faster)
+                    if (useOffscreenCanvas && offscreenCanvas) {
+                        // OffscreenCanvas: use convertToBlob (async, non-blocking)
+                        const blob = await offscreenCanvas.convertToBlob({
+                            type: 'image/jpeg',
+                            quality: quality
+                        });
+                        const arrayBuffer = await blob.arrayBuffer();
+                        websocket.send(arrayBuffer);
+                    } else {
+                        // Regular canvas: use toBlob (callback-based)
+                        captureCanvas.toBlob(async (blob) => {
+                            if (blob && websocket.readyState === WebSocket.OPEN) {
+                                const arrayBuffer = await blob.arrayBuffer();
+                                websocket.send(arrayBuffer);
+                            }
+                        }, 'image/jpeg', quality);
+                    }
+                } else {
+                    // Base64 protocol (fallback)
+                    const b64 = captureCanvas.toDataURL('image/jpeg', quality).split(',')[1];
+                    websocket.send(b64);
+                }
+                
                 pendingFrames++;
             } catch (e) {
                 // Fallback to direct drawImage if createImageBitmap fails
                 ctx.drawImage(localVideo, 0, 0);
                 const quality = streamConfig.jpeg_quality_client / 100;
-                const b64 = captureCanvas.toDataURL('image/jpeg', quality).split(',')[1];
-                websocket.send(b64);
-                pendingFrames++;
+                
+                if (useBinaryProtocol) {
+                    captureCanvas.toBlob(async (blob) => {
+                        if (blob && websocket.readyState === WebSocket.OPEN) {
+                            const arrayBuffer = await blob.arrayBuffer();
+                            websocket.send(arrayBuffer);
+                            pendingFrames++;
+                        }
+                    }, 'image/jpeg', quality);
+                } else {
+                    const b64 = captureCanvas.toDataURL('image/jpeg', quality).split(',')[1];
+                    websocket.send(b64);
+                    pendingFrames++;
+                }
             }
         }
 
@@ -1167,21 +1349,112 @@
                 document.getElementById('fps').innerHTML = `${fps.toFixed(1)}<small>fps</small>`;
             }
 
-            // Smooth image update using preloading
+            // Smooth image update using double-buffering
             if (res.processed_frame) {
-                // Preload the image to prevent flicker
-                const img = new Image();
-                img.onload = () => {
-                    resultImage.src = img.src;
-                };
-                img.src = res.processed_frame;
+                // Convert base64 data URI to blob for double-buffered rendering
+                if (resultCanvasCtx) {
+                    // Fetch the data URI and convert to blob for canvas rendering
+                    fetch(res.processed_frame)
+                        .then(r => r.blob())
+                        .then(blob => {
+                            // Add to display buffer for smooth rendering
+                            if (displayBuffer.length < MAX_DISPLAY_BUFFER) {
+                                displayBuffer.push({ blob, detections: res.detections });
+                            } else {
+                                // Buffer full, drop oldest frame
+                                displayBuffer.shift();
+                                displayBuffer.push({ blob, detections: res.detections });
+                            }
+                        })
+                        .catch(e => {
+                            // Fallback to img element if fetch fails
+                            resultImage.style.display = 'block';
+                            resultCanvas.style.display = 'none';
+                            resultImage.src = res.processed_frame;
+                        });
+                } else {
+                    // Fallback to img element
+                    resultImage.style.display = 'block';
+                    resultCanvas.style.display = 'none';
+                    resultImage.src = res.processed_frame;
+                }
             }
 
-            if (res.detections && res.detections.length > 0) {
-                totalDetections += res.detections.length;
+            processDetections(res.detections, res.processed_frame);
+        }
+        
+        // Handle binary protocol response
+        function handleBinaryResponse(arrayBuffer) {
+            // Decrease pending frame counter
+            pendingFrames = Math.max(0, pendingFrames - 1);
+            
+            try {
+                // Binary protocol format:
+                // First 4 bytes: JSON header length (uint32, little-endian)
+                // Next N bytes: JSON header (contains status, detections, latency)
+                // Remaining bytes: JPEG frame data
+                
+                const dataView = new DataView(arrayBuffer);
+                const headerLength = dataView.getUint32(0, true); // little-endian
+                
+                // Parse JSON header
+                const headerBytes = new Uint8Array(arrayBuffer, 4, headerLength);
+                const headerText = new TextDecoder().decode(headerBytes);
+                const header = JSON.parse(headerText);
+                
+                if (header.status !== 'success') {
+                    console.warn('[Binary] Error response:', header.error);
+                    return;
+                }
+                
+                frameCount++;
+                document.getElementById('frameCount').textContent = frameCount;
+                document.getElementById('latency').innerHTML = `${header.processing_latency_ms.toFixed(0)}<small>ms</small>`;
+                
+                // Calculate accurate FPS
+                const now = Date.now();
+                fpsTimestamps.push(now);
+                while (fpsTimestamps.length > 0 && now - fpsTimestamps[0] > 2000) {
+                    fpsTimestamps.shift();
+                }
+                if (fpsTimestamps.length > 1) {
+                    const duration = (now - fpsTimestamps[0]) / 1000;
+                    const fps = (fpsTimestamps.length - 1) / duration;
+                    document.getElementById('fps').innerHTML = `${fps.toFixed(1)}<small>fps</small>`;
+                }
+                
+                // Extract JPEG frame bytes and create blob
+                const frameOffset = 4 + headerLength;
+                const frameBytes = new Uint8Array(arrayBuffer, frameOffset);
+                const blob = new Blob([frameBytes], { type: 'image/jpeg' });
+                
+                // Add to display buffer for smooth rendering
+                if (displayBuffer.length < MAX_DISPLAY_BUFFER) {
+                    displayBuffer.push({ blob, detections: header.detections });
+                } else {
+                    displayBuffer.shift();
+                    displayBuffer.push({ blob, detections: header.detections });
+                }
+                
+                // Create object URL for log items
+                const frameUrl = URL.createObjectURL(blob);
+                processDetections(header.detections, frameUrl);
+                
+                // Cleanup URL after a delay
+                setTimeout(() => URL.revokeObjectURL(frameUrl), 5000);
+                
+            } catch (e) {
+                console.error('[Binary] Failed to parse response:', e);
+            }
+        }
+        
+        // Common detection processing logic
+        function processDetections(detections, frameSource) {
+            if (detections && detections.length > 0) {
+                totalDetections += detections.length;
                 document.getElementById('totalDetections').textContent = totalDetections;
 
-                res.detections.forEach(det => {
+                detections.forEach(det => {
                     const code = getClassCode(det.class);
                     if (code && classCounts[code] !== undefined) {
                         classCounts[code]++;
@@ -1196,14 +1469,11 @@
                         bbox: det.bbox
                     });
 
-                    addLogItem(det, res.processed_frame);
+                    addLogItem(det, frameSource);
                     
                     // Update pending chart data
                     if (code && pendingCounts[code] !== undefined) {
                         pendingCounts[code]++;
-                        console.log('[Detection] Received class:', det.class, '-> Code:', code, '| Count:', pendingCounts[code]);
-                    } else {
-                        console.warn('[Detection] Unknown class:', det.class);
                     }
                 });
 

@@ -18,6 +18,7 @@ from utils.cloudinary_uploader import upload_to_cloudinary
 from utils.stream_utils import encode_frame_to_base64, decode_base64_to_frame
 import requests
 import time
+import secrets
 
 # Configure logging
 logging.basicConfig(
@@ -304,7 +305,7 @@ async def get_stream_config():
     return STREAM_CONFIG
 
 
-async def handle_stream_prediction(websocket: WebSocket, model_key: str, selected_model):
+async def handle_stream_prediction(websocket: WebSocket, model_key: str, selected_model, device_id: str):
     """
     Shared handler for real-time video streaming using WebSocket.
     
@@ -334,51 +335,49 @@ async def handle_stream_prediction(websocket: WebSocket, model_key: str, selecte
     try:
         while True:
             # Receive frame from client
-            logger.debug(f"[STEP] Waiting for frame {frame_index} from client...")
             data = await websocket.receive_text()
             start_time = time.time()
-            logger.debug(f"[STEP] Received frame data, size: {len(data)} bytes")
             
             try:
                 # Decode base64 frame
-                logger.debug(f"[STEP] Decoding base64 frame...")
                 frame = decode_base64_to_frame(data)
-                logger.debug(f"[STEP] Frame decoded, shape: {frame.shape if frame is not None else 'None'}")
                 
-                # Run YOLO prediction with selected model (imgsz from config for faster inference)
-                logger.debug(f"[STEP] Running YOLO prediction on device: {DEVICE}")
-                results = selected_model(frame, device=DEVICE, verbose=False, imgsz=STREAM_CONFIG['yolo_imgsz'])
-                result = results[0]
-                logger.debug(f"[STEP] Prediction complete, boxes: {len(result.boxes)}")
+                # Run YOLO prediction in thread pool (non-blocking)
+                import asyncio
                 
-                # Get annotated frame
-                logger.debug(f"[STEP] Plotting annotated frame...")
-                annotated_frame = result.plot()
+                def process_frame_sync(frame_data):
+                    """Synchronous frame processing for thread pool execution."""
+                    results = selected_model(frame_data, device=DEVICE, verbose=False, imgsz=STREAM_CONFIG['yolo_imgsz'])
+                    result = results[0]
+                    annotated_frame = result.plot()
+                    
+                    # Extract detections
+                    detections = []
+                    for box in result.boxes:
+                        c = int(box.cls)
+                        class_name = selected_model.names[c]
+                        conf = float(box.conf)
+                        xyxy = box.xyxy.tolist()[0]
+                        detections.append({
+                            "class": class_name,
+                            "confidence": round(conf, 4),
+                            "bbox": [round(x, 2) for x in xyxy]
+                        })
+                    
+                    return annotated_frame, detections
+                
+                # Run inference in thread pool
+                annotated_frame, detections = await asyncio.to_thread(process_frame_sync, frame)
                 
                 # Encode processed frame to base64 (quality from config)
-                logger.debug(f"[STEP] Encoding frame to base64...")
                 processed_frame_b64 = encode_frame_to_base64(annotated_frame, quality=STREAM_CONFIG['jpeg_quality_server'])
-                
-                # Extract detection data
-                logger.debug(f"[STEP] Extracting detection data...")
-                detections = []
-                for box in result.boxes:
-                    c = int(box.cls)
-                    class_name = selected_model.names[c]
-                    conf = float(box.conf)
-                    xyxy = box.xyxy.tolist()[0]
-                    detections.append({
-                        "class": class_name,
-                        "confidence": round(conf, 4),
-                        "bbox": [round(x, 2) for x in xyxy]
-                    })
                 
                 # Calculate processing latency
                 processing_latency = (time.time() - start_time) * 1000
                 
                 # Send response
-                logger.debug(f"[STEP] Preparing response JSON...")
                 response = {
+                    "device_id": device_id,
                     "status": "success",
                     "model": model_key,
                     "frame_index": frame_index,
@@ -389,13 +388,12 @@ async def handle_stream_prediction(websocket: WebSocket, model_key: str, selecte
                     "detection_count": len(detections)
                 }
                 
-                # Log to terminal
-                logger.info(f"[Stream:{model_key}] Frame {frame_index:04d} | "
-                      f"Detections: {len(detections):2d} | "
-                      f"Latency: {processing_latency:6.2f}ms | "
-                      f"Classes: {[d['class'] for d in detections]}")
+                # Log to terminal (less verbose for performance)
+                if frame_index % 30 == 0:  # Log every 30 frames
+                    logger.info(f"[Stream:{model_key}] Frame {frame_index:04d} | "
+                          f"Detections: {len(detections):2d} | "
+                          f"Latency: {processing_latency:6.2f}ms")
                 
-                logger.debug(f"[STEP] Sending response to client...")
                 await websocket.send_json(response)
                 frame_index += 1
                 
@@ -423,17 +421,161 @@ async def handle_stream_prediction(websocket: WebSocket, model_key: str, selecte
             logger.error(f"[STEP] Failed to send error response: {send_error}")
 
 
+def decode_bytes_to_frame(image_bytes: bytes) -> np.ndarray:
+    """
+    Decode raw JPEG bytes to OpenCV frame.
+    
+    Args:
+        image_bytes: Raw JPEG bytes
+    
+    Returns:
+        OpenCV BGR frame (numpy array)
+    
+    Raises:
+        ValueError: If decoding fails
+    """
+    try:
+        np_array = np.frombuffer(image_bytes, dtype=np.uint8)
+        frame = cv2.imdecode(np_array, cv2.IMREAD_COLOR)
+        
+        if frame is None:
+            raise ValueError("Failed to decode image")
+        
+        return frame
+    except Exception as e:
+        raise ValueError(f"Invalid image data: {e}")
+
+
+async def handle_binary_stream_prediction(websocket: WebSocket, model_key: str, selected_model):
+    """
+    Binary protocol handler for high-performance video streaming.
+    
+    Protocol:
+    - Client sends: Raw JPEG bytes (binary)
+    - Server returns: Binary message with format:
+        - First 4 bytes: JSON header length (uint32, little-endian)
+        - Next N bytes: JSON header (status, detections, latency, etc.)
+        - Remaining bytes: JPEG frame data
+    
+    This provides ~33% bandwidth reduction compared to base64.
+    """
+    logger.info(f"[STEP] handle_binary_stream_prediction() called for model: {model_key}")
+    await websocket.accept()
+    frame_index = 0
+    
+    logger.info(f"[BinaryStream:{model_key}] Client connected (binary protocol)")
+    
+    try:
+        while True:
+            # Receive binary frame from client
+            data = await websocket.receive_bytes()
+            start_time = time.time()
+            
+            try:
+                # Decode raw JPEG bytes
+                frame = decode_bytes_to_frame(data)
+                
+                # Run YOLO prediction in thread pool (non-blocking)
+                import asyncio
+                
+                def process_frame_sync(frame_data):
+                    """Synchronous frame processing for thread pool execution."""
+                    results = selected_model(frame_data, device=DEVICE, verbose=False, imgsz=STREAM_CONFIG['yolo_imgsz'])
+                    result = results[0]
+                    annotated_frame = result.plot()
+                    
+                    # Extract detections
+                    detections = []
+                    for box in result.boxes:
+                        c = int(box.cls)
+                        class_name = selected_model.names[c]
+                        conf = float(box.conf)
+                        xyxy = box.xyxy.tolist()[0]
+                        detections.append({
+                            "class": class_name,
+                            "confidence": round(conf, 4),
+                            "bbox": [round(x, 2) for x in xyxy]
+                        })
+                    
+                    return annotated_frame, detections
+                
+                # Run inference in thread pool
+                annotated_frame, detections = await asyncio.to_thread(process_frame_sync, frame)
+                
+                # Encode processed frame to JPEG bytes (not base64)
+                from utils.stream_utils import encode_frame_to_bytes
+                frame_bytes = encode_frame_to_bytes(annotated_frame, quality=STREAM_CONFIG['jpeg_quality_server'])
+                
+                # Calculate processing latency
+                processing_latency = (time.time() - start_time) * 1000
+                
+                # Create JSON header (without frame data)
+                import json
+                header = {
+                    "status": "success",
+                    "model": model_key,
+                    "frame_index": frame_index,
+                    "timestamp_ms": int(time.time() * 1000),
+                    "processing_latency_ms": round(processing_latency, 2),
+                    "detections": detections,
+                    "detection_count": len(detections)
+                }
+                header_json = json.dumps(header).encode('utf-8')
+                header_length = len(header_json)
+                
+                # Build binary response: [4 bytes header length] + [header JSON] + [JPEG bytes]
+                import struct
+                response = struct.pack('<I', header_length) + header_json + frame_bytes
+                
+                # Log to terminal (less verbose for better performance)
+                if frame_index % 30 == 0:  # Log every 30 frames
+                    logger.info(f"[BinaryStream:{model_key}] Frame {frame_index:04d} | "
+                          f"Detections: {len(detections):2d} | "
+                          f"Latency: {processing_latency:6.2f}ms | "
+                          f"Size: {len(response)} bytes")
+                
+                await websocket.send_bytes(response)
+                frame_index += 1
+                
+            except ValueError as e:
+                logger.error(f"[BinaryStream] ValueError processing frame: {e}")
+                # Send error as JSON text (fallback)
+                import json
+                await websocket.send_text(json.dumps({
+                    "status": "error",
+                    "model": model_key,
+                    "frame_index": frame_index,
+                    "error": str(e)
+                }))
+                
+    except WebSocketDisconnect:
+        logger.info(f"[BinaryStream:{model_key}] WebSocket disconnected after {frame_index} frames")
+    except Exception as e:
+        logger.exception(f"[BinaryStream:{model_key}] WebSocket error: {e}")
+        try:
+            import json
+            await websocket.send_text(json.dumps({
+                "status": "error",
+                "model": model_key,
+                "error": str(e)
+            }))
+        except Exception as send_error:
+            logger.error(f"[STEP] Failed to send error response: {send_error}")
+
+
 # Default stream endpoint (uses default model)
-@app.websocket("/predict/stream")
-async def predict_stream_default(websocket: WebSocket):
+@app.websocket("/predict/stream/{device_id}")
+async def predict_stream_default(websocket: WebSocket, device_id: str):
     """Default stream endpoint using the default model (pytorch or first available)."""
     logger.info("[STEP] predict_stream_default() endpoint called")
-    await handle_stream_prediction(websocket, "default", model)
+    session_id = secrets.token_hex(16)
+    print("session id", session_id)
+    await handle_stream_prediction(websocket, "default", model, device_id)
 
 
 # Dynamic stream endpoints for each loaded model
-@app.websocket("/predict/stream/{model_key}")
-async def predict_stream_model(websocket: WebSocket, model_key: str):
+@app.websocket("/predict/stream/{model_key}/{device_id}")
+async def predict_stream_model(websocket: WebSocket, model_key: str, device_id: int):
     """
     Model-specific stream endpoint.
     
@@ -444,6 +586,8 @@ async def predict_stream_model(websocket: WebSocket, model_key: str):
     - /predict/stream/tflite-16 : TFLite Float16
     - /predict/stream/pytorch : PyTorch Original
     """
+    session_id = secrets.token_hex(16)
+    print("session id", session_id)
     logger.info(f"[STEP] predict_stream_model() endpoint called for model: {model_key}")
     
     if model_key not in models:
@@ -458,7 +602,54 @@ async def predict_stream_model(websocket: WebSocket, model_key: str):
     
     selected_model = models[model_key]
     logger.debug(f"[STEP] Selected model: {model_key}")
-    await handle_stream_prediction(websocket, model_key, selected_model)
+    await handle_stream_prediction(websocket, model_key, device_id)
+
+
+# Binary stream endpoints (high-performance, ~33% bandwidth reduction)
+@app.websocket("/predict/stream-binary")
+async def predict_stream_binary_default(websocket: WebSocket):
+    """
+    Default binary stream endpoint for high-performance video streaming.
+    Uses raw JPEG bytes instead of base64, reducing bandwidth by ~33%.
+    """
+    logger.info("[STEP] predict_stream_binary_default() endpoint called")
+    await handle_binary_stream_prediction(websocket, "default", model)
+
+
+@app.websocket("/predict/stream-binary/{model_key}")
+async def predict_stream_binary_model(websocket: WebSocket, model_key: str):
+    """
+    Model-specific binary stream endpoint for high-performance video streaming.
+    
+    Binary Protocol:
+    - Client sends: Raw JPEG bytes
+    - Server returns: [4-byte header length] + [JSON header] + [JPEG bytes]
+    
+    Available models:
+    - /predict/stream-binary/tfrt-32 : TensorRT Float32
+    - /predict/stream-binary/tfrt-16 : TensorRT Float16
+    - /predict/stream-binary/tflite-32 : TFLite Float32
+    - /predict/stream-binary/tflite-16 : TFLite Float16
+    - /predict/stream-binary/pytorch : PyTorch Original
+    """
+    session_id = secrets.token_hex(16)
+    logger.info(f"[STEP] session id: {session_id}")
+    logger.info(f"[STEP] predict_stream_binary_model() endpoint called for model: {model_key}")
+    
+    if model_key not in models:
+        logger.error(f"[STEP] Model not found: {model_key}. Available: {list(models.keys())}")
+        await websocket.accept()
+        import json
+        await websocket.send_text(json.dumps({
+            "status": "error",
+            "error": f"Model '{model_key}' not loaded. Available models: {list(models.keys())}"
+        }))
+        await websocket.close()
+        return
+    
+    selected_model = models[model_key]
+    logger.debug(f"[STEP] Selected model: {model_key}")
+    await handle_binary_stream_prediction(websocket, model_key, selected_model)
 
 
 @app.post("/predict")
