@@ -546,6 +546,14 @@
                 </select>
             </div>
 
+            <div class="model-picker">
+                <label for="protocolSelect">Protocol</label>
+                <select id="protocolSelect">
+                    <option value="webrtc" selected>WebRTC</option>
+                    <option value="websocket">WebSocket</option>
+                </select>
+            </div>
+
             <div class="status-indicator" id="statusBadge" data-status="offline">
                 <span class="status-dot"></span>
                 <span id="statusText">Offline</span>
@@ -591,7 +599,7 @@
                 <div class="video-card">
                     <video id="remoteVideo" autoplay playsinline></video>
                     <img id="resultImage" alt="Detection" style="display: none;">
-                    <span class="video-label">Processed (WebRTC)</span>
+                    <span class="video-label" id="processedLabel">Processed</span>
                 </div>
             </div>
 
@@ -850,6 +858,16 @@
             console.log('[Model]', selectedModel || 'default');
         });
 
+        // Protocol selection handler
+        const protocolSelect = document.getElementById('protocolSelect');
+        const processedLabel = document.getElementById('processedLabel');
+        
+        protocolSelect.addEventListener('change', e => {
+            useWebRTC = e.target.value === 'webrtc';
+            processedLabel.textContent = useWebRTC ? 'Processed (WebRTC)' : 'Processed (WebSocket)';
+            console.log('[Protocol]', useWebRTC ? 'WebRTC' : 'WebSocket');
+        });
+
         function getWSUrl() {
             return selectedModel ? `${WS_BASE}/predict/stream/${selectedModel}` : `${WS_BASE}/predict/stream`;
         }
@@ -1038,11 +1056,16 @@
                 setStatus('connecting', 'WebRTC Connecting...');
                 console.log('[WebRTC] Starting connection...');
 
-                // Get local video stream
+                // Get local video stream with settings from ENV (via /webrtc/config)
+                const vw = webrtcConfig.video_width || 640;
+                const vh = webrtcConfig.video_height || 480;
+                const vfps = webrtcConfig.video_fps || 24;
+                
                 mediaStream = await navigator.mediaDevices.getUserMedia({
                     video: { 
-                        width: streamConfig.camera_width, 
-                        height: streamConfig.camera_height, 
+                        width: { ideal: vw, max: vw * 2 },
+                        height: { ideal: vh, max: vh * 1.5 },
+                        frameRate: { ideal: vfps, max: vfps + 6 },
                         facingMode: 'environment' 
                     },
                     audio: false
@@ -1631,11 +1654,22 @@
                 // Apply ICE servers config
                 webrtcConfig = { iceServers: config.iceServers || [] };
                 
-                console.log('[WebRTC] Config loaded:', webrtcConfig);
-                console.log('[WebRTC] Available models:', config.available_models);
+                // Save video settings for WebRTC stream
+                webrtcConfig.video_width = config.video_width || 640;
+                webrtcConfig.video_height = config.video_height || 480;
+                webrtcConfig.video_fps = config.video_fps || 24;
+                
+                console.log('[WebRTC] Config loaded:', {
+                    video: `${webrtcConfig.video_width}x${webrtcConfig.video_height}@${webrtcConfig.video_fps}fps`,
+                    yolo_imgsz: config.yolo_imgsz,
+                    skip_frames: config.skip_frames,
+                    iceServers: webrtcConfig.iceServers.length
+                });
             } catch (e) {
-                console.warn('[WebRTC] Using default config (no STUN/TURN):', e.message);
-                // Keep using WebRTC even if config fetch fails
+                console.warn('[WebRTC] Using default config:', e.message);
+                webrtcConfig.video_width = 640;
+                webrtcConfig.video_height = 480;
+                webrtcConfig.video_fps = 24;
             }
         }
 

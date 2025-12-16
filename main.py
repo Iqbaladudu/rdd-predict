@@ -78,6 +78,20 @@ STREAM_CONFIG = {
 }
 logger.info(f"[CONFIG] Streaming settings: {STREAM_CONFIG}")
 
+# WebRTC configuration from environment
+_ice_servers_str = os.getenv("WEBRTC_ICE_SERVERS", "")
+_ice_servers = [{"urls": s.strip()} for s in _ice_servers_str.split(",") if s.strip()]
+
+WEBRTC_CONFIG = {
+    "video_width": int(os.getenv("WEBRTC_VIDEO_WIDTH", "640")),
+    "video_height": int(os.getenv("WEBRTC_VIDEO_HEIGHT", "480")),
+    "video_fps": int(os.getenv("WEBRTC_VIDEO_FPS", "24")),
+    "yolo_imgsz": int(os.getenv("WEBRTC_YOLO_IMGSZ", "480")),
+    "skip_frames": int(os.getenv("WEBRTC_SKIP_FRAMES", "0")),
+    "ice_servers": _ice_servers,
+}
+logger.info(f"[CONFIG] WebRTC settings: {WEBRTC_CONFIG}")
+
 app = FastAPI()
 
 # Allow CORS
@@ -278,7 +292,7 @@ webrtc_manager = WebRTCSessionManager(
     models=models,
     default_model=model,
     device=DEVICE,
-    stream_config=STREAM_CONFIG
+    stream_config=WEBRTC_CONFIG  # Use WebRTC-specific config
 )
 logger.info("[WebRTC] Session manager initialized")
 
@@ -332,13 +346,25 @@ async def get_stream_config():
 @app.get("/webrtc/config")
 async def get_webrtc_config():
     """
-    Get WebRTC configuration.
+    Get WebRTC configuration from environment.
     
-    Returns ICE servers configuration. For VPS with public IP, 
-    no STUN/TURN is typically needed.
+    Returns video quality settings and ICE servers configuration.
+    Edit .env to change these values.
     """
     return {
-        "iceServers": [],  # Empty = no STUN/TURN needed for VPS with public IP
+        # Video capture settings (used by browser)
+        "video_width": WEBRTC_CONFIG["video_width"],
+        "video_height": WEBRTC_CONFIG["video_height"],
+        "video_fps": WEBRTC_CONFIG["video_fps"],
+        
+        # YOLO settings (used by server)
+        "yolo_imgsz": WEBRTC_CONFIG["yolo_imgsz"],
+        "skip_frames": WEBRTC_CONFIG["skip_frames"],
+        
+        # ICE servers
+        "iceServers": WEBRTC_CONFIG["ice_servers"],
+        
+        # Available models
         "available_models": list(models.keys()),
         "default_model": "pytorch" if "pytorch" in models else (list(models.keys())[0] if models else None)
     }
@@ -652,7 +678,7 @@ async def predict_media(file: UploadFile = File(...)):
         elif extension in ["mp4", "avi", "mov", "mkv", "webm"]:
             logger.info(f"[STEP] Processing as VIDEO: {extension}")
             result_type = "video"
-            # Process Video
+            # Process Video with BATCH PROCESSING + STREAM MODE optimization
             logger.debug(f"[STEP] Opening video capture...")
             cap = cv2.VideoCapture(str(input_path))
             if not cap.isOpened():
@@ -678,64 +704,146 @@ async def predict_media(file: UploadFile = File(...)):
             fourcc = cv2.VideoWriter_fourcc(*'mp4v') 
             out = cv2.VideoWriter(str(output_path), fourcc, fps, (width, height))
             
+            # ============================================================
+            # OPTIMIZATION: Batch Processing + Stream Mode
+            # - Batch size 8 optimal untuk GPU (sesuaikan dengan VRAM)
+            # - Stream mode untuk memory efficiency pada video panjang
+            # ============================================================
+            BATCH_SIZE = 12  # Adjust based on GPU memory (reduce if OOM)
+            
             frame_idx = 0
+            frames_batch = []  # Buffer untuk batch processing
+            frame_indices = []  # Track frame indices dalam batch
+            
+            logger.info(f"[STEP] Using BATCH PROCESSING with batch_size={BATCH_SIZE}")
+            start_time = time.time()
+            
             while cap.isOpened():
                 success, frame = cap.read()
                 if not success:
+                    # Process remaining frames in batch jika ada
+                    if frames_batch:
+                        logger.debug(f"[STEP] Processing final batch of {len(frames_batch)} frames")
+                        # Use stream=True for memory efficiency
+                        batch_results = model(frames_batch, device=DEVICE, stream=True)
+                        
+                        for i, result in enumerate(batch_results):
+                            current_frame_idx = frame_indices[i]
+                            current_frame = frames_batch[i]
+                            
+                            # Write frame with annotations
+                            annotated_frame = result.plot()
+                            out.write(annotated_frame)
+                            
+                            # Extract data
+                            frame_detections = []
+                            for box in result.boxes:
+                                c = int(box.cls)
+                                class_name = model.names[c]
+                                conf = float(box.conf)
+                                xyxy = box.xyxy.tolist()[0]
+                                frame_detections.append({
+                                    "class": class_name,
+                                    "confidence": conf,
+                                    "bbox": xyxy
+                                })
+                            
+                            if frame_detections:
+                                logger.debug(f"[STEP] Frame {current_frame_idx}: {len(frame_detections)} detections found")
+                                # Save frame as image and upload to Cloudinary
+                                frame_filename = f"{request_id}_frame_{current_frame_idx}.jpg"
+                                frame_path = Path(f"static/{frame_filename}")
+                                cv2.imwrite(str(frame_path), annotated_frame)
+
+                                # Upload frame to Cloudinary
+                                logger.debug(f"[STEP] Uploading frame {current_frame_idx} to Cloudinary...")
+                                frame_cloudinary_result = upload_to_cloudinary(str(frame_path))
+
+                                # Clean up the frame file to save space
+                                if os.path.exists(frame_path):
+                                    os.remove(frame_path)
+
+                                results_data.append({
+                                    "frame": current_frame_idx,
+                                    "timestamp": current_frame_idx / fps if fps > 0 else 0,
+                                    "detections": frame_detections,
+                                    "frame_url": frame_cloudinary_result.get("url"),
+                                    "frame_public_id": frame_cloudinary_result.get("public_id")
+                                })
+                    
                     logger.debug(f"[STEP] Video read complete at frame {frame_idx}")
                     break
+                
+                # Add frame to batch
+                frames_batch.append(frame)
+                frame_indices.append(frame_idx)
+                
+                # Process batch when full
+                if len(frames_batch) >= BATCH_SIZE:
+                    if frame_idx % 100 < BATCH_SIZE:
+                        elapsed = time.time() - start_time
+                        fps_processing = frame_idx / elapsed if elapsed > 0 else 0
+                        logger.debug(f"[STEP] Processing batch at frame {frame_idx}/{total_frames} ({fps_processing:.1f} FPS)")
                     
-                # Run YOLO
-                if frame_idx % 100 == 0:
-                    logger.debug(f"[STEP] Processing frame {frame_idx}/{total_frames}")
-                results = model(frame, device=DEVICE)
-                result = results[0]
-                
-                # Write frame with annotations
-                annotated_frame = result.plot()
-                out.write(annotated_frame)
-                
-                # Extract data
-                frame_detections = []
-                for box in result.boxes:
-                    c = int(box.cls)
-                    class_name = model.names[c]
-                    conf = float(box.conf)
-                    xyxy = box.xyxy.tolist()[0]
-                    frame_detections.append({
-                        "class": class_name,
-                        "confidence": conf,
-                        "bbox": xyxy
-                    })
-                
-                if frame_detections:
-                    logger.debug(f"[STEP] Frame {frame_idx}: {len(frame_detections)} detections found")
-                    # Save frame as image and upload to Cloudinary
-                    frame_filename = f"{request_id}_frame_{frame_idx}.jpg"
-                    frame_path = Path(f"static/{frame_filename}")
-                    cv2.imwrite(str(frame_path), annotated_frame)
+                    # BATCH INFERENCE with stream=True for memory efficiency
+                    batch_results = model(frames_batch, device=DEVICE, stream=True)
+                    
+                    for i, result in enumerate(batch_results):
+                        current_frame_idx = frame_indices[i]
+                        current_frame = frames_batch[i]
+                        
+                        # Write frame with annotations
+                        annotated_frame = result.plot()
+                        out.write(annotated_frame)
+                        
+                        # Extract data
+                        frame_detections = []
+                        for box in result.boxes:
+                            c = int(box.cls)
+                            class_name = model.names[c]
+                            conf = float(box.conf)
+                            xyxy = box.xyxy.tolist()[0]
+                            frame_detections.append({
+                                "class": class_name,
+                                "confidence": conf,
+                                "bbox": xyxy
+                            })
+                        
+                        if frame_detections:
+                            logger.debug(f"[STEP] Frame {current_frame_idx}: {len(frame_detections)} detections found")
+                            # Save frame as image and upload to Cloudinary
+                            frame_filename = f"{request_id}_frame_{current_frame_idx}.jpg"
+                            frame_path = Path(f"static/{frame_filename}")
+                            cv2.imwrite(str(frame_path), annotated_frame)
 
-                    # Upload frame to Cloudinary
-                    logger.debug(f"[STEP] Uploading frame {frame_idx} to Cloudinary...")
-                    frame_cloudinary_result = upload_to_cloudinary(str(frame_path))
+                            # Upload frame to Cloudinary
+                            logger.debug(f"[STEP] Uploading frame {current_frame_idx} to Cloudinary...")
+                            frame_cloudinary_result = upload_to_cloudinary(str(frame_path))
 
-                    # Clean up the frame file to save space
-                    if os.path.exists(frame_path):
-                        os.remove(frame_path)
+                            # Clean up the frame file to save space
+                            if os.path.exists(frame_path):
+                                os.remove(frame_path)
 
-                    results_data.append({
-                        "frame": frame_idx,
-                        "timestamp": frame_idx / fps if fps > 0 else 0,
-                        "detections": frame_detections,
-                        "frame_url": frame_cloudinary_result.get("url"),
-                        "frame_public_id": frame_cloudinary_result.get("public_id")
-                    })
+                            results_data.append({
+                                "frame": current_frame_idx,
+                                "timestamp": current_frame_idx / fps if fps > 0 else 0,
+                                "detections": frame_detections,
+                                "frame_url": frame_cloudinary_result.get("url"),
+                                "frame_public_id": frame_cloudinary_result.get("public_id")
+                            })
+                    
+                    # Clear batch after processing
+                    frames_batch = []
+                    frame_indices = []
                 
                 frame_idx += 1
                 
             cap.release()
             out.release()
-            logger.info(f"[STEP] Video processing complete, {frame_idx} frames processed")
+            
+            total_time = time.time() - start_time
+            avg_fps = frame_idx / total_time if total_time > 0 else 0
+            logger.info(f"[STEP] Video processing complete: {frame_idx} frames in {total_time:.2f}s ({avg_fps:.1f} FPS)")
 
             # Upload processed video to Cloudinary
             logger.info(f"[STEP] Uploading processed video to Cloudinary...")

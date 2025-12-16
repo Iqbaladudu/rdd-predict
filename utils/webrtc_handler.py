@@ -3,6 +3,12 @@ WebRTC handler for real-time video streaming with YOLO inference.
 
 This module provides WebRTC-based video processing using aiortc library,
 following industry best practices for low-latency real-time streaming.
+
+OPTIMIZATIONS:
+- ThreadPoolExecutor for non-blocking YOLO inference
+- Frame skipping when processing is slow
+- Reduced logging overhead
+- Direct numpy array manipulation
 """
 
 import asyncio
@@ -10,6 +16,7 @@ import json
 import logging
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, Optional, Set, Any
 
 import cv2
@@ -26,18 +33,25 @@ relay = MediaRelay()
 # Track active peer connections
 peer_connections: Set[RTCPeerConnection] = set()
 
+# Thread pool for YOLO inference (non-blocking)
+inference_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="yolo_inference")
+
+
+def run_yolo_inference(model, img, device, imgsz):
+    """Run YOLO inference in thread pool (CPU-bound operation)."""
+    results = model(img, device=device, verbose=False, imgsz=imgsz)
+    return results[0]
+
 
 class VideoProcessorTrack(MediaStreamTrack):
     """
-    A video track that processes frames through YOLO model.
+    Optimized video track that processes frames through YOLO model.
     
-    This track receives video frames from the client, runs YOLO inference,
-    and returns annotated frames. Detection results are sent via DataChannel.
-    
-    Best Practices Applied:
-    - Uses native video frames (no base64 encoding overhead)
-    - Separates video stream from detection data (DataChannel)
-    - Supports H.264/VP8 for low-latency encoding
+    OPTIMIZATIONS APPLIED:
+    - Non-blocking inference using ThreadPoolExecutor
+    - Frame skipping when processing is slow
+    - Minimal logging to reduce overhead
+    - Direct frame manipulation without copies
     """
     
     kind = "video"
@@ -48,8 +62,8 @@ class VideoProcessorTrack(MediaStreamTrack):
         model: Any,
         model_key: str = "default",
         device: str = "cpu",
-        imgsz: int = 480,
-        jpeg_quality: int = 70
+        imgsz: int = 320,  # Reduced default for faster inference
+        skip_frames: int = 0  # Process every Nth frame (0 = process all)
     ):
         super().__init__()
         self.track = track
@@ -57,17 +71,29 @@ class VideoProcessorTrack(MediaStreamTrack):
         self.model_key = model_key
         self.device = device
         self.imgsz = imgsz
-        self.jpeg_quality = jpeg_quality
+        self.skip_frames = skip_frames
         
         # DataChannel for sending detection results
         self.datachannel: Optional[RTCDataChannel] = None
         
         # Metrics
         self.frame_count = 0
+        self.processed_count = 0
         self.total_detections = 0
         self.start_time = time.time()
         
-        logger.info(f"[WebRTC:{model_key}] VideoProcessorTrack created on device: {device}")
+        # Processing state
+        self._processing = False
+        self._pending_result = None
+        self._last_annotated = None
+        self._last_detections = []
+        
+        # Performance tracking
+        self._last_log_time = time.time()
+        self._latency_sum = 0
+        self._latency_count = 0
+        
+        logger.info(f"[WebRTC:{model_key}] VideoProcessorTrack created | device:{device} | imgsz:{imgsz}")
     
     def set_datachannel(self, channel: RTCDataChannel):
         """Set the data channel for sending detection results."""
@@ -76,76 +102,102 @@ class VideoProcessorTrack(MediaStreamTrack):
     
     async def recv(self) -> VideoFrame:
         """
-        Receive a frame, process it with YOLO, and return annotated frame.
-        Detection results are sent via DataChannel.
+        Receive a frame with optimized processing pipeline.
+        Uses non-blocking inference and frame skipping.
         """
         frame = await self.track.recv()
-        start_time = time.time()
+        self.frame_count += 1
         
-        try:
-            # Convert frame to numpy array (BGR format for OpenCV)
-            img = frame.to_ndarray(format="bgr24")
+        # Get frame as numpy array
+        img = frame.to_ndarray(format="bgr24")
+        
+        # Determine if we should process this frame
+        should_process = (
+            not self._processing and  # Not already processing
+            (self.skip_frames == 0 or self.frame_count % (self.skip_frames + 1) == 0)  # Skip logic
+        )
+        
+        if should_process:
+            self._processing = True
+            start_time = time.time()
             
-            # Run YOLO inference
-            results = self.model(img, device=self.device, verbose=False, imgsz=self.imgsz)
-            result = results[0]
-            
-            # Get annotated frame
-            annotated = result.plot()
-            
-            # Extract detections
-            detections = []
-            for box in result.boxes:
-                c = int(box.cls)
-                class_name = self.model.names[c]
-                conf = float(box.conf)
-                xyxy = box.xyxy.tolist()[0]
-                detections.append({
-                    "class": class_name,
-                    "confidence": round(conf, 4),
-                    "bbox": [round(x, 2) for x in xyxy]
-                })
-            
-            # Calculate processing latency
-            processing_latency = (time.time() - start_time) * 1000
-            self.frame_count += 1
-            self.total_detections += len(detections)
-            
-            # Send detection results via DataChannel
-            if self.datachannel and self.datachannel.readyState == "open":
-                detection_data = {
-                    "status": "success",
-                    "model": self.model_key,
-                    "frame_index": self.frame_count,
-                    "timestamp_ms": int(time.time() * 1000),
-                    "processing_latency_ms": round(processing_latency, 2),
-                    "detections": detections,
-                    "detection_count": len(detections)
-                }
-                try:
-                    self.datachannel.send(json.dumps(detection_data))
-                except Exception as e:
-                    logger.warning(f"[WebRTC:{self.model_key}] Failed to send detection data: {e}")
-            
-            # Log frame processing
-            if self.frame_count % 30 == 0 or len(detections) > 0:
-                logger.info(
-                    f"[WebRTC:{self.model_key}] Frame {self.frame_count:04d} | "
-                    f"Detections: {len(detections):2d} | "
-                    f"Latency: {processing_latency:6.2f}ms"
+            try:
+                # Run YOLO inference in thread pool (non-blocking)
+                loop = asyncio.get_event_loop()
+                result = await loop.run_in_executor(
+                    inference_executor,
+                    run_yolo_inference,
+                    self.model, img, self.device, self.imgsz
                 )
-            
-            # Convert back to VideoFrame
-            new_frame = VideoFrame.from_ndarray(annotated, format="bgr24")
+                
+                # Get annotated frame
+                annotated = result.plot()
+                
+                # Extract detections (minimal processing)
+                detections = []
+                if len(result.boxes) > 0:
+                    for box in result.boxes:
+                        c = int(box.cls)
+                        detections.append({
+                            "class": self.model.names[c],
+                            "confidence": round(float(box.conf), 3),
+                            "bbox": [round(x, 1) for x in box.xyxy.tolist()[0]]
+                        })
+                
+                # Update cached results
+                self._last_annotated = annotated
+                self._last_detections = detections
+                self.processed_count += 1
+                self.total_detections += len(detections)
+                
+                # Track latency
+                latency = (time.time() - start_time) * 1000
+                self._latency_sum += latency
+                self._latency_count += 1
+                
+                # Send detection results via DataChannel
+                if self.datachannel and self.datachannel.readyState == "open":
+                    try:
+                        self.datachannel.send(json.dumps({
+                            "status": "success",
+                            "model": self.model_key,
+                            "frame_index": self.processed_count,
+                            "timestamp_ms": int(time.time() * 1000),
+                            "processing_latency_ms": round(latency, 1),
+                            "detections": detections,
+                            "detection_count": len(detections)
+                        }))
+                    except Exception:
+                        pass  # Ignore send errors
+                
+            except Exception as e:
+                logger.error(f"[WebRTC:{self.model_key}] Inference error: {e}")
+            finally:
+                self._processing = False
+        
+        # Log stats periodically (every 5 seconds)
+        now = time.time()
+        if now - self._last_log_time >= 5.0:
+            elapsed = now - self.start_time
+            fps = self.frame_count / elapsed if elapsed > 0 else 0
+            avg_latency = self._latency_sum / self._latency_count if self._latency_count > 0 else 0
+            logger.info(
+                f"[WebRTC:{self.model_key}] FPS:{fps:.1f} | "
+                f"Frames:{self.frame_count} | "
+                f"Processed:{self.processed_count} | "
+                f"AvgLatency:{avg_latency:.1f}ms | "
+                f"Detections:{self.total_detections}"
+            )
+            self._last_log_time = now
+        
+        # Return annotated frame if available, otherwise original
+        if self._last_annotated is not None:
+            new_frame = VideoFrame.from_ndarray(self._last_annotated, format="bgr24")
             new_frame.pts = frame.pts
             new_frame.time_base = frame.time_base
-            
             return new_frame
-            
-        except Exception as e:
-            logger.error(f"[WebRTC:{self.model_key}] Error processing frame: {e}")
-            # Return original frame if processing fails
-            return frame
+        
+        return frame
     
     def stop(self):
         """Stop the track and cleanup resources."""
@@ -154,9 +206,10 @@ class VideoProcessorTrack(MediaStreamTrack):
         avg_fps = self.frame_count / elapsed if elapsed > 0 else 0
         logger.info(
             f"[WebRTC:{self.model_key}] Track stopped | "
-            f"Frames: {self.frame_count} | "
-            f"Avg FPS: {avg_fps:.2f} | "
-            f"Total detections: {self.total_detections}"
+            f"Frames:{self.frame_count} | "
+            f"Processed:{self.processed_count} | "
+            f"AvgFPS:{avg_fps:.1f} | "
+            f"Detections:{self.total_detections}"
         )
 
 
@@ -228,14 +281,14 @@ class WebRTCSessionManager:
             logger.info(f"[WebRTC:{session_id}] Received track: {track.kind}")
             
             if track.kind == "video":
-                # Create processor track with YOLO inference
+                # Create processor track with YOLO inference (settings from ENV)
                 processor_track = VideoProcessorTrack(
                     track=relay.subscribe(track),
                     model=model,
                     model_key=model_key,
                     device=self.device,
                     imgsz=self.stream_config.get("yolo_imgsz", 480),
-                    jpeg_quality=self.stream_config.get("jpeg_quality_server", 70)
+                    skip_frames=self.stream_config.get("skip_frames", 0)
                 )
                 self.session_tracks[session_id] = processor_track
                 
