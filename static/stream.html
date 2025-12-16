@@ -589,8 +589,9 @@
                     <span class="video-label live">Camera</span>
                 </div>
                 <div class="video-card">
-                    <img id="resultImage" alt="Detection">
-                    <span class="video-label">Processed</span>
+                    <video id="remoteVideo" autoplay playsinline></video>
+                    <img id="resultImage" alt="Detection" style="display: none;">
+                    <span class="video-label">Processed (WebRTC)</span>
                 </div>
             </div>
 
@@ -730,6 +731,11 @@
         let availableModels = [];
         let selectedModel = null;
 
+        // WebRTC State
+        let peerConnection = null;
+        let dataChannel = null;
+        let useWebRTC = true; // Toggle between WebRTC and WebSocket fallback
+        
         const classCounts = { D00: 0, D10: 0, D20: 0, D40: 0 };
         const detectionHistory = [];
         let chart = null;
@@ -738,16 +744,16 @@
         const chartData = { D00: [], D10: [], D20: [], D40: [] };
         const pendingCounts = { D00: 0, D10: 0, D20: 0, D40: 0 };
         
-        // Smooth streaming variables
+        // Smooth streaming variables (for WebSocket fallback)
         let animationFrameId = null;
         let lastFrameTime = 0;
-        let targetFPS = 30; // Default, will be overwritten by server config
+        let targetFPS = 30;
         let frameDuration = 1000 / targetFPS;
-        let pendingFrames = 0; // Track frames waiting for response
-        let maxPendingFrames = 5; // Default, will be overwritten by server config
-        let frameBuffer = null; // Buffer for smooth image display
+        let pendingFrames = 0;
+        let maxPendingFrames = 5;
+        let frameBuffer = null;
         let lastDisplayedFrame = null;
-        let fpsTimestamps = []; // For accurate FPS calculation
+        let fpsTimestamps = [];
         
         // Stream configuration (loaded from server)
         let streamConfig = {
@@ -756,6 +762,11 @@
             camera_width: 640,
             camera_height: 480,
             jpeg_quality_client: 50
+        };
+        
+        // WebRTC configuration (loaded from server)
+        let webrtcConfig = {
+            iceServers: [] // Empty for VPS with public IP (no STUN/TURN needed)
         };
         
         // Class name to code mapping
@@ -789,6 +800,7 @@
 
         // DOM
         const localVideo = document.getElementById('localVideo');
+        const remoteVideo = document.getElementById('remoteVideo');
         const resultImage = document.getElementById('resultImage');
         const captureCanvas = document.getElementById('captureCanvas');
         const ctx = captureCanvas.getContext('2d');
@@ -1011,10 +1023,279 @@
             return 'RDD-' + Date.now().toString(36).toUpperCase();
         }
 
-        // Stream
+        // Stream - Main entry point
         async function startStreaming() {
+            if (useWebRTC) {
+                await startWebRTC();
+            } else {
+                await startWebSocket();
+            }
+        }
+
+        // WebRTC Streaming Implementation
+        async function startWebRTC() {
             try {
-                setStatus('connecting', 'Connecting...');
+                setStatus('connecting', 'WebRTC Connecting...');
+                console.log('[WebRTC] Starting connection...');
+
+                // Get local video stream
+                mediaStream = await navigator.mediaDevices.getUserMedia({
+                    video: { 
+                        width: streamConfig.camera_width, 
+                        height: streamConfig.camera_height, 
+                        facingMode: 'environment' 
+                    },
+                    audio: false
+                });
+
+                localVideo.srcObject = mediaStream;
+                
+                // Wait for video metadata
+                if (localVideo.readyState < 1) {
+                    await new Promise(r => localVideo.onloadedmetadata = r);
+                }
+                
+                try {
+                    await localVideo.play();
+                } catch (playErr) {
+                    console.warn('[Video] Autoplay blocked:', playErr);
+                }
+
+                document.getElementById('resolution').textContent = `${localVideo.videoWidth}×${localVideo.videoHeight}`;
+
+                // Create peer connection
+                peerConnection = new RTCPeerConnection(webrtcConfig);
+                console.log('[WebRTC] PeerConnection created');
+
+                // Add local tracks to connection
+                mediaStream.getTracks().forEach(track => {
+                    peerConnection.addTrack(track, mediaStream);
+                    console.log('[WebRTC] Added local track:', track.kind);
+                });
+
+                // Handle incoming tracks (processed video from server)
+                peerConnection.ontrack = (event) => {
+                    console.log('[WebRTC] Received remote track:', event.track.kind);
+                    if (event.streams && event.streams[0]) {
+                        remoteVideo.srcObject = event.streams[0];
+                        remoteVideo.style.display = 'block';
+                        resultImage.style.display = 'none';
+                        console.log('[WebRTC] Remote video stream attached');
+                    }
+                };
+
+                // Connection state monitoring
+                peerConnection.onconnectionstatechange = () => {
+                    console.log('[WebRTC] Connection state:', peerConnection.connectionState);
+                    if (peerConnection.connectionState === 'connected') {
+                        setStatus('online', 'WebRTC Active');
+                    } else if (peerConnection.connectionState === 'failed') {
+                        console.error('[WebRTC] Connection failed, falling back to WebSocket');
+                        stopStreaming();
+                        useWebRTC = false;
+                        startWebSocket();
+                    } else if (peerConnection.connectionState === 'disconnected') {
+                        setStatus('offline', 'Disconnected');
+                        stopStreaming();
+                    }
+                };
+
+                peerConnection.oniceconnectionstatechange = () => {
+                    console.log('[WebRTC] ICE state:', peerConnection.iceConnectionState);
+                };
+
+                // Create data channel for receiving detection results
+                dataChannel = peerConnection.createDataChannel('detections', {
+                    ordered: true
+                });
+                console.log('[WebRTC] DataChannel created');
+
+                dataChannel.onopen = () => {
+                    console.log('[WebRTC] DataChannel opened');
+                };
+
+                dataChannel.onmessage = (event) => {
+                    try {
+                        const data = JSON.parse(event.data);
+                        handleWebRTCDetection(data);
+                    } catch (e) {
+                        console.error('[WebRTC] Error parsing detection data:', e);
+                    }
+                };
+
+                dataChannel.onerror = (error) => {
+                    console.error('[WebRTC] DataChannel error:', error);
+                };
+
+                // Create offer
+                const offer = await peerConnection.createOffer();
+                await peerConnection.setLocalDescription(offer);
+                console.log('[WebRTC] Offer created');
+
+                // Wait for ICE gathering to complete (or timeout after 2s)
+                await new Promise((resolve) => {
+                    if (peerConnection.iceGatheringState === 'complete') {
+                        resolve();
+                    } else {
+                        const timeout = setTimeout(resolve, 2000);
+                        peerConnection.onicegatheringstatechange = () => {
+                            if (peerConnection.iceGatheringState === 'complete') {
+                                clearTimeout(timeout);
+                                resolve();
+                            }
+                        };
+                    }
+                });
+
+                // Send offer to server
+                const offerUrl = selectedModel 
+                    ? `${API_BASE}/webrtc/offer/${selectedModel}`
+                    : `${API_BASE}/webrtc/offer`;
+                
+                console.log('[WebRTC] Sending offer to:', offerUrl);
+                
+                const response = await fetch(offerUrl, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        sdp: peerConnection.localDescription.sdp,
+                        type: peerConnection.localDescription.type
+                    })
+                });
+
+                if (!response.ok) {
+                    throw new Error(`Server error: ${response.status}`);
+                }
+
+                const answer = await response.json();
+                console.log('[WebRTC] Received answer, session:', answer.session_id);
+
+                // Set remote description
+                await peerConnection.setRemoteDescription(
+                    new RTCSessionDescription({ sdp: answer.sdp, type: answer.type })
+                );
+                console.log('[WebRTC] Remote description set');
+
+                // Initialize session
+                isStreaming = true;
+                frameCount = 0;
+                totalDetections = 0;
+                startTime = Date.now();
+                sessionId = answer.session_id || genSessionId();
+                fpsTimestamps = [];
+
+                Object.keys(classCounts).forEach(k => classCounts[k] = 0);
+                updateCounts();
+
+                document.getElementById('sessionId').textContent = sessionId;
+                document.getElementById('sessionStart').textContent = formatTime(new Date());
+                document.getElementById('startBtn').disabled = true;
+                document.getElementById('stopBtn').disabled = false;
+
+                durationInterval = setInterval(updateDuration, 1000);
+                startChartUpdates();
+
+            } catch (err) {
+                console.error('[WebRTC] Error:', err);
+                setStatus('offline', 'WebRTC Error');
+                
+                // Fallback to WebSocket
+                console.log('[WebRTC] Falling back to WebSocket...');
+                useWebRTC = false;
+                stopStreaming();
+                await startWebSocket();
+            }
+        }
+
+        // Handle detection data from WebRTC DataChannel
+        function handleWebRTCDetection(data) {
+            if (data.status !== 'success') return;
+
+            frameCount++;
+            document.getElementById('frameCount').textContent = frameCount;
+            document.getElementById('latency').innerHTML = `${data.processing_latency_ms.toFixed(0)}<small>ms</small>`;
+
+            // Calculate FPS
+            const now = Date.now();
+            fpsTimestamps.push(now);
+            while (fpsTimestamps.length > 0 && now - fpsTimestamps[0] > 2000) {
+                fpsTimestamps.shift();
+            }
+            if (fpsTimestamps.length > 1) {
+                const duration = (now - fpsTimestamps[0]) / 1000;
+                const fps = (fpsTimestamps.length - 1) / duration;
+                document.getElementById('fps').innerHTML = `${fps.toFixed(1)}<small>fps</small>`;
+            }
+
+            // Process detections
+            if (data.detections && data.detections.length > 0) {
+                totalDetections += data.detections.length;
+                document.getElementById('totalDetections').textContent = totalDetections;
+
+                data.detections.forEach(det => {
+                    const code = getClassCode(det.class);
+                    if (code && classCounts[code] !== undefined) {
+                        classCounts[code]++;
+                    }
+
+                    detectionHistory.push({
+                        frame: frameCount,
+                        timestamp: new Date().toISOString(),
+                        class: det.class,
+                        code: code,
+                        confidence: det.confidence,
+                        bbox: det.bbox
+                    });
+
+                    // Create thumbnail from remote video for log
+                    if (remoteVideo.videoWidth > 0) {
+                        captureCanvas.width = 48;
+                        captureCanvas.height = 36;
+                        ctx.drawImage(remoteVideo, 0, 0, 48, 36);
+                        const thumbUrl = captureCanvas.toDataURL('image/jpeg', 0.5);
+                        addLogItemWithThumb(det, thumbUrl);
+                    }
+
+                    // Update pending chart data
+                    if (code && pendingCounts[code] !== undefined) {
+                        pendingCounts[code]++;
+                    }
+                });
+
+                updateCounts();
+            }
+        }
+
+        function addLogItemWithThumb(det, thumbUrl) {
+            const log = document.getElementById('detectionLog');
+            const empty = log.querySelector('.log-empty');
+            if (empty) empty.remove();
+
+            const item = document.createElement('div');
+            item.className = 'log-item';
+            item.innerHTML = `
+                <img class="log-thumb" src="${thumbUrl}" alt="">
+                <div class="log-content">
+                    <div class="log-header">
+                        <span class="log-class">${det.class}</span>
+                        <span class="log-time">${formatTime(new Date())}</span>
+                    </div>
+                    <div class="log-meta">
+                        <span class="conf">${(det.confidence * 100).toFixed(1)}%</span> · Frame ${frameCount}
+                    </div>
+                </div>
+            `;
+
+            log.insertBefore(item, log.firstChild);
+            while (log.children.length > 50) {
+                log.removeChild(log.lastChild);
+            }
+        }
+
+        // WebSocket Streaming (Fallback)
+        async function startWebSocket() {
+            try {
+                setStatus('connecting', 'WS Connecting...');
 
                 mediaStream = await navigator.mediaDevices.getUserMedia({
                     video: { 
@@ -1027,30 +1308,30 @@
 
                 localVideo.srcObject = mediaStream;
                 
-                // Wait for video metadata to load
-                if (localVideo.readyState >= 1) {
-                    // Metadata already loaded
-                } else {
+                if (localVideo.readyState < 1) {
                     await new Promise(r => localVideo.onloadedmetadata = r);
                 }
                 
-                // Ensure video plays
                 try {
                     await localVideo.play();
                 } catch (playErr) {
-                    console.warn('[Video] Autoplay blocked, user interaction may be needed:', playErr);
+                    console.warn('[Video] Autoplay blocked:', playErr);
                 }
 
                 captureCanvas.width = localVideo.videoWidth;
                 captureCanvas.height = localVideo.videoHeight;
                 document.getElementById('resolution').textContent = `${localVideo.videoWidth}×${localVideo.videoHeight}`;
 
+                // Switch to image display for WebSocket mode
+                remoteVideo.style.display = 'none';
+                resultImage.style.display = 'block';
+
                 const url = getWSUrl();
                 console.log('[WS] Connecting:', url);
                 websocket = new WebSocket(url);
 
                 websocket.onopen = () => {
-                    setStatus('online', 'Active');
+                    setStatus('online', 'WS Active');
                     isStreaming = true;
                     frameCount = 0;
                     totalDetections = 0;
@@ -1067,7 +1348,6 @@
                     document.getElementById('startBtn').disabled = true;
                     document.getElementById('stopBtn').disabled = false;
 
-                    // Use requestAnimationFrame for smooth capture
                     lastFrameTime = performance.now();
                     requestAnimationFrame(smoothCaptureLoop);
                     
@@ -1080,7 +1360,7 @@
                 websocket.onerror = () => setStatus('offline', 'Error');
 
             } catch (err) {
-                console.error(err);
+                console.error('[WS] Error:', err);
                 setStatus('offline', 'Error');
             }
         }
@@ -1088,14 +1368,34 @@
         function stopStreaming() {
             isStreaming = false;
 
+            // Stop WebRTC
+            if (dataChannel) {
+                dataChannel.close();
+                dataChannel = null;
+            }
+            if (peerConnection) {
+                peerConnection.close();
+                peerConnection = null;
+            }
+
+            // Stop WebSocket
             if (animationFrameId) cancelAnimationFrame(animationFrameId);
             if (captureInterval) clearInterval(captureInterval);
             if (durationInterval) clearInterval(durationInterval);
             stopChartUpdates();
-            if (websocket) websocket.close();
-            if (mediaStream) mediaStream.getTracks().forEach(t => t.stop());
+            if (websocket) {
+                websocket.close();
+                websocket = null;
+            }
+
+            // Stop media
+            if (mediaStream) {
+                mediaStream.getTracks().forEach(t => t.stop());
+                mediaStream = null;
+            }
 
             localVideo.srcObject = null;
+            remoteVideo.srcObject = null;
             pendingFrames = 0;
             document.getElementById('startBtn').disabled = false;
             document.getElementById('stopBtn').disabled = true;
@@ -1321,9 +1621,28 @@
             }
         }
 
+        // Fetch WebRTC config from server
+        async function fetchWebRTCConfig() {
+            try {
+                const res = await fetch(`${API_BASE}/webrtc/config`);
+                if (!res.ok) throw new Error(`HTTP ${res.status}`);
+                const config = await res.json();
+                
+                // Apply ICE servers config
+                webrtcConfig = { iceServers: config.iceServers || [] };
+                
+                console.log('[WebRTC] Config loaded:', webrtcConfig);
+                console.log('[WebRTC] Available models:', config.available_models);
+            } catch (e) {
+                console.warn('[WebRTC] Using default config (no STUN/TURN):', e.message);
+                // Keep using WebRTC even if config fetch fails
+            }
+        }
+
         // Init
         initChart();
         fetchStreamConfig();
+        fetchWebRTCConfig();
         fetchModels();
     </script>
 </body>

@@ -8,9 +8,11 @@ from typing import List, Union
 import cv2
 import numpy as np
 from PIL.Image import Image
-from fastapi import FastAPI, File, UploadFile, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, File, UploadFile, HTTPException, WebSocket, WebSocketDisconnect, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
 import torch
 from ultralytics import YOLO
 from utils.boto import upload_file
@@ -18,6 +20,10 @@ from utils.cloudinary_uploader import upload_to_cloudinary
 from utils.stream_utils import encode_frame_to_base64, decode_base64_to_frame
 import requests
 import time
+
+# WebRTC imports
+from aiortc import RTCSessionDescription
+from utils.webrtc_handler import WebRTCSessionManager, cleanup_peer_connections
 
 # Configure logging
 logging.basicConfig(
@@ -267,6 +273,21 @@ model = models.get("pytorch") or (list(models.values())[0] if models else None)
 if model is None:
     raise RuntimeError("No models could be loaded!")
 
+# Initialize WebRTC Session Manager
+webrtc_manager = WebRTCSessionManager(
+    models=models,
+    default_model=model,
+    device=DEVICE,
+    stream_config=STREAM_CONFIG
+)
+logger.info("[WebRTC] Session manager initialized")
+
+
+# Pydantic model for WebRTC offer
+class RTCOfferRequest(BaseModel):
+    sdp: str
+    type: str
+
 @app.get("/")
 def read_root():
     return {"message": "RDD Predict API is running"}
@@ -302,6 +323,100 @@ async def list_models():
 async def get_stream_config():
     """Get streaming configuration for the frontend."""
     return STREAM_CONFIG
+
+
+# =============================================================================
+# WebRTC Endpoints (Low-latency real-time video streaming)
+# =============================================================================
+
+@app.get("/webrtc/config")
+async def get_webrtc_config():
+    """
+    Get WebRTC configuration.
+    
+    Returns ICE servers configuration. For VPS with public IP, 
+    no STUN/TURN is typically needed.
+    """
+    return {
+        "iceServers": [],  # Empty = no STUN/TURN needed for VPS with public IP
+        "available_models": list(models.keys()),
+        "default_model": "pytorch" if "pytorch" in models else (list(models.keys())[0] if models else None)
+    }
+
+
+@app.post("/webrtc/offer")
+async def webrtc_offer_default(request: RTCOfferRequest):
+    """
+    WebRTC signaling endpoint using default model.
+    
+    Receives SDP offer from client, creates peer connection with 
+    video processing capabilities, and returns SDP answer.
+    
+    The server will:
+    1. Receive video track from client
+    2. Process each frame with YOLO model
+    3. Send processed video track back
+    4. Send detection results via DataChannel
+    """
+    try:
+        offer = RTCSessionDescription(sdp=request.sdp, type=request.type)
+        answer, session_id = await webrtc_manager.create_session(offer)
+        
+        return {
+            "sdp": answer.sdp,
+            "type": answer.type,
+            "session_id": session_id
+        }
+    except Exception as e:
+        logger.error(f"[WebRTC] Error creating session: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/webrtc/offer/{model_key}")
+async def webrtc_offer_model(model_key: str, request: RTCOfferRequest):
+    """
+    WebRTC signaling endpoint with specific model.
+    
+    Available models:
+    - pytorch: PyTorch Original
+    - tfrt-32: TensorRT Float32
+    - tfrt-16: TensorRT Float16
+    - tflite-32: TFLite Float32  
+    - tflite-16: TFLite Float16
+    """
+    if model_key not in models:
+        raise HTTPException(
+            status_code=404, 
+            detail=f"Model '{model_key}' not loaded. Available: {list(models.keys())}"
+        )
+    
+    try:
+        offer = RTCSessionDescription(sdp=request.sdp, type=request.type)
+        answer, session_id = await webrtc_manager.create_session(offer, model_key=model_key)
+        
+        return {
+            "sdp": answer.sdp,
+            "type": answer.type,
+            "session_id": session_id,
+            "model": model_key
+        }
+    except Exception as e:
+        logger.error(f"[WebRTC] Error creating session with model {model_key}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/webrtc/stats")
+async def get_webrtc_stats():
+    """Get WebRTC session statistics."""
+    return webrtc_manager.get_stats()
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Cleanup WebRTC connections on server shutdown."""
+    logger.info("[WebRTC] Server shutting down, cleaning up connections...")
+    await webrtc_manager.close_all_sessions()
+    await cleanup_peer_connections()
 
 
 async def handle_stream_prediction(websocket: WebSocket, model_key: str, selected_model):
